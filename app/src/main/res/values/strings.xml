@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">RemoteMonitor</string>
+    <style name="Theme.RemoteMonitor" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:textColor">@android:color/white</item>
+        <item name="colorPrimary">#222222</item>
+        <item name="colorPrimaryVariant">#000000</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+    </style>
+</resources>
