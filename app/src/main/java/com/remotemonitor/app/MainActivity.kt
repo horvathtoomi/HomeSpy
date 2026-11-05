@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
@@ -26,7 +27,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var root: ScrollView
     private val handler = Handler(Looper.getMainLooper())
     private var dimmed = false
-    private var dimOverride = false
+    // null = automatic (dim only while STREAMING); non-null = explicit user override
+    private var manualDim: Boolean? = null
 
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -58,14 +60,23 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnSave).setOnClickListener {
             AppConfig.save(this, etToken.text.toString(), etNtfy.text.toString(), etMqtt.text.toString())
             restartService()
+            reloadServiceConfig()
             refreshUi()
         }
         findViewById<Button>(R.id.btnDim).setOnClickListener {
-            dimOverride = !dimmed
-            applyDim(dimOverride)
+            manualDim = !dimmed
+            applyDim(manualDim!!)
         }
         findViewById<Button>(R.id.btnPerms).setOnClickListener { requestAllPerms() }
         findViewById<Button>(R.id.btnService).setOnClickListener { restartService() }
+
+        root.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_DOWN && dimmed) {
+                manualDim = false
+                applyDim(false)
+            }
+            false
+        }
 
         MonitorBus.onStateChanged = { runOnUiThread { refreshUi() } }
         requestAllPerms()
@@ -82,8 +93,20 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
     }
 
+    override fun onDestroy() {
+        MonitorBus.onStateChanged = null
+        super.onDestroy()
+    }
+
     private fun restartService() {
         val i = Intent(this, MonitorService::class.java)
+        try { ContextCompat.startForegroundService(this, i) } catch (_: Exception) {}
+    }
+
+    private fun reloadServiceConfig() {
+        val i = Intent(this, MonitorService::class.java).apply {
+            action = MonitorService.ACTION_RELOAD_CONFIG
+        }
         try { ContextCompat.startForegroundService(this, i) } catch (_: Exception) {}
     }
 
@@ -116,7 +139,7 @@ class MainActivity : AppCompatActivity() {
         }
         tvDetails.text = details
 
-        val shouldDim = (state == MonitorState.IDLE || state == MonitorState.STREAMING) && !dimOverride
+        val shouldDim = manualDim ?: (state == MonitorState.STREAMING)
         if (shouldDim != dimmed) applyDim(shouldDim)
     }
 

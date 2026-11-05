@@ -3,6 +3,8 @@ package com.remotemonitor.app
 import android.content.Context
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0", port) {
@@ -35,8 +37,11 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
             Log.w(TAG, "401 invalid token on /api/control")
             return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
         }
-        MonitorService.instance?.applyPayload(payload)
+        val svc = MonitorService.instance
             ?: return json(Response.Status.SERVICE_UNAVAILABLE, """{"ok":false,"error":"service not running"}""")
+        runBlocking {
+            withTimeoutOrNull(4000) { svc.applyPayloadSync(payload) }
+        }
         val accepted = JSONObject().apply {
             put("ok", true)
             put("accepted", payload.action)

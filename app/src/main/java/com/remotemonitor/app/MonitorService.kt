@@ -10,7 +10,6 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.wifi.WifiManager
 import android.os.BatteryManager
-import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
@@ -20,6 +19,7 @@ import com.pedro.encoder.input.video.CameraHelper
 import com.pedro.library.base.Camera2Base
 import com.pedro.library.rtmp.RtmpCamera2
 import com.pedro.library.rtsp.RtspCamera2
+import com.pedro.library.util.streamclient.StreamBaseClient
 import com.pedro.rtspserver.RtspServerCamera2
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.*
@@ -37,6 +37,7 @@ class MonitorService : Service(), ConnectChecker {
         private const val CHANNEL_ID = "monitor_channel"
         private const val NOTIF_ID = 1001
         const val ACTION_APPLY = "com.remotemonitor.app.APPLY"
+        const val ACTION_RELOAD_CONFIG = "com.remotemonitor.app.RELOAD_CONFIG"
         const val EXTRA_PAYLOAD = "payload"
 
         @Volatile var instance: MonitorService? = null
@@ -55,7 +56,6 @@ class MonitorService : Service(), ConnectChecker {
     private var apiServer: ControlApiServer? = null
     private var ntfyWatcher: NtfyWatcher? = null
     private var mqttWatcher: MqttWatcher? = null
-    private var controlReceiver: ControlReceiver? = null
 
     private val sseClient = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -83,33 +83,38 @@ class MonitorService : Service(), ConnectChecker {
         mqttWatcher = MqttWatcher(this) { payload -> applyPayload(payload) }
         mqttWatcher?.start()
 
-        controlReceiver = ControlReceiver()
-        val f = IntentFilter(ControlReceiver.ACTION)
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(controlReceiver, f, Context.RECEIVER_EXPORTED)
-        } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(controlReceiver, f)
-        }
         updateNotification("IDLE")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_APPLY) {
-            val raw = intent.getStringExtra(EXTRA_PAYLOAD)
-            val payload = raw?.let { ControlPayload.parse(it) }
-            if (payload != null) applyPayload(payload)
+        when (intent?.action) {
+            ACTION_APPLY -> {
+                val raw = intent.getStringExtra(EXTRA_PAYLOAD)
+                val payload = raw?.let { ControlPayload.parse(it) }
+                if (payload != null) applyPayload(payload)
+            }
+            ACTION_RELOAD_CONFIG -> {
+                Log.i(TAG, "Reloading Ntfy/MQTT config")
+                ntfyWatcher?.reload()
+                mqttWatcher?.reload()
+            }
         }
         return START_STICKY
     }
 
     fun applyPayload(payload: ControlPayload) {
+        scope.launch { applyPayloadSync(payload) }
+    }
+
+    suspend fun applyPayloadSync(payload: ControlPayload) {
         if (!AppConfig.tokenMatches(this, payload.authToken)) {
             MonitorBus.failedAuthCount++
             Log.w(TAG, "Rejected payload: invalid auth token (count=${MonitorBus.failedAuthCount})")
             return
         }
-        scope.launch {
+        // Callers (e.g. ControlApiServer via runBlocking on a NanoHTTPD worker thread) may invoke
+        // this off the main thread; camera/encoder calls must still happen on the main looper.
+        withContext(Dispatchers.Main.immediate) {
             mutex.withLock {
                 when (payload.action) {
                     "START" -> handleStart(payload)
@@ -227,22 +232,24 @@ class MonitorService : Service(), ConnectChecker {
                 }
             }
             server.startStream()
+            ensureCameraFacing(server, isBack, isAudioOnly)
             val ip = bestIp()
             MonitorBus.streamUrl = "rtsp://$ip:8554/live"
             true
         } else if (target.startsWith("rtmp", true)) {
             val client = RtmpCamera2(this, this)
             rtmpClient = client
-            startClient(client, target, isAudioOnly, isVideoOnly, isBack, w, h)
+            startClient(client, client.getStreamClient(), target, isAudioOnly, isVideoOnly, isBack, w, h)
         } else {
             val client = RtspCamera2(this, this)
             rtspClient = client
-            startClient(client, target, isAudioOnly, isVideoOnly, isBack, w, h)
+            startClient(client, client.getStreamClient(), target, isAudioOnly, isVideoOnly, isBack, w, h)
         }
     }
 
     private fun startClient(
         client: Camera2Base,
+        streamClient: StreamBaseClient,
         target: String,
         isAudioOnly: Boolean,
         isVideoOnly: Boolean,
@@ -264,6 +271,9 @@ class MonitorService : Service(), ConnectChecker {
         if (isVideoOnly && !videoOk) return false
         if (!isAudioOnly && !isVideoOnly && (!audioOk || !videoOk)) return false
 
+        streamClient.setOnlyAudio(isAudioOnly)
+        streamClient.setOnlyVideo(isVideoOnly)
+
         if (!isAudioOnly) {
             try {
                 val facing = if (isBack) CameraHelper.Facing.BACK else CameraHelper.Facing.FRONT
@@ -273,8 +283,26 @@ class MonitorService : Service(), ConnectChecker {
             }
         }
         client.startStream(target)
+        ensureCameraFacing(client, isBack, isAudioOnly)
         MonitorBus.streamUrl = target
         return true
+    }
+
+    /**
+     * Surface-less Camera2Base sessions don't always honor the requested facing on
+     * startPreview(); verify the active camera matches the request and switch if not.
+     */
+    private fun ensureCameraFacing(client: Camera2Base, isBack: Boolean, isAudioOnly: Boolean) {
+        if (isAudioOnly) return
+        try {
+            val wanted = if (isBack) CameraHelper.Facing.BACK else CameraHelper.Facing.FRONT
+            if (client.cameraFacing != wanted) {
+                Log.i(TAG, "Active camera facing mismatch, switching camera")
+                client.switchCamera()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "switchCamera error", e)
+        }
     }
 
     private fun cleanupStreamers() {
@@ -287,6 +315,7 @@ class MonitorService : Service(), ConnectChecker {
     }
 
     fun statusJson(): JSONObject = JSONObject().apply {
+        val ips = allIps()
         put("ok", true)
         put("state", MonitorBus.state.name)
         put("mode", MonitorBus.activePayload?.mode ?: "NONE")
@@ -305,8 +334,8 @@ class MonitorService : Service(), ConnectChecker {
         put("ips", JSONObject().apply {
             put("wifi", getInterfaceIp("wlan0"))
             put("vpn", getInterfaceIp("tun0"))
-            put("best", bestIp())
-            put("all", allIps().joinToString(","))
+            put("best", bestIp(ips))
+            put("all", ips.joinToString(","))
         })
     }
 
@@ -329,12 +358,11 @@ class MonitorService : Service(), ConnectChecker {
             ?.hostAddress ?: ""
     } catch (_: Exception) { "" }
 
-    private fun bestIp(): String {
+    private fun bestIp(all: List<String> = allIps()): String {
         val vpn = getInterfaceIp("tun0")
         if (vpn.isNotBlank()) return vpn
         val wifi = getInterfaceIp("wlan0")
         if (wifi.isNotBlank()) return wifi
-        val all = allIps()
         return all.firstOrNull { it.startsWith("100.") } // tailscale
             ?: all.firstOrNull { it.startsWith("192.168.") }
             ?: all.firstOrNull { it.startsWith("10.") }
@@ -408,12 +436,17 @@ class MonitorService : Service(), ConnectChecker {
     }
 
     override fun onDestroy() {
-        scope.launch { mutex.withLock { handleStop("service destroyed") } }
+        watchdogJob?.cancel()
+        cleanupStreamers()
+        releaseStreamingLocks()
+        MonitorBus.activePayload = null
+        MonitorBus.streamUrl = ""
+        MonitorBus.startedAtMs = 0L
+        MonitorBus.endsAtMs = 0L
+        MonitorBus.update(MonitorState.IDLE)
         try { apiServer?.stop() } catch (_: Exception) {}
         ntfyWatcher?.stop()
         mqttWatcher?.stop()
-        try { controlReceiver?.let { unregisterReceiver(it) } } catch (_: Exception) {}
-        releaseStreamingLocks()
         scope.cancel()
         instance = null
         super.onDestroy()

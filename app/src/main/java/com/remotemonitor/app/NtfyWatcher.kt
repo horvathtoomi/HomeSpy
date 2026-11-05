@@ -36,6 +36,12 @@ class NtfyWatcher(
         handler.removeCallbacksAndMessages(null)
     }
 
+    fun reload() {
+        stop()
+        backoffMs = 1000L
+        start()
+    }
+
     private fun connect() {
         if (!running) return
         val topic = AppConfig.ntfyTopic(ctx)
@@ -43,7 +49,7 @@ class NtfyWatcher(
             handler.postDelayed({ connect() }, 5000)
             return
         }
-        val url = "https://ntfy.sh/${topic}/json"
+        val url = "https://ntfy.sh/${topic}/sse"
         Log.i(TAG, "Connecting SSE: $url")
         val req = Request.Builder().url(url).header("Accept", "text/event-stream").build()
         val factory = EventSources.createFactory(client)

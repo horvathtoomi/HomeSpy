@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import org.eclipse.paho.client.mqttv3.*
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
+import java.net.URI
 import java.util.UUID
 
 class MqttWatcher(
@@ -33,14 +34,39 @@ class MqttWatcher(
         client = null
     }
 
+    fun reload() {
+        stop()
+        start()
+    }
+
     private fun connect() {
         if (!running) return
-        val rawUrl = AppConfig.mqttUrl(ctx).trim()
+        var rawUrl = AppConfig.mqttUrl(ctx).trim()
         if (rawUrl.isBlank()) {
             handler.postDelayed({ connect() }, 10_000)
             return
         }
+        rawUrl = when {
+            rawUrl.startsWith("mqtts://", ignoreCase = true) -> "ssl://" + rawUrl.substring("mqtts://".length)
+            rawUrl.startsWith("mqtt://", ignoreCase = true) -> "tcp://" + rawUrl.substring("mqtt://".length)
+            else -> rawUrl
+        }
         try {
+            var username: String? = null
+            var password: String? = null
+            try {
+                val uri = URI(rawUrl)
+                val userInfo = uri.userInfo
+                if (!userInfo.isNullOrBlank()) {
+                    val parts = userInfo.split(":", limit = 2)
+                    username = parts.getOrNull(0)
+                    password = parts.getOrNull(1)
+                    rawUrl = "${uri.scheme}://${uri.host}:${uri.port}${uri.path ?: ""}"
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "MQTT URL parse warning: ${e.message}")
+            }
+
             val clientId = "RemoteMonitor_" + UUID.randomUUID().toString().substring(0, 8)
             val c = MqttAsyncClient(rawUrl, clientId, MemoryPersistence())
             client = c
@@ -49,6 +75,8 @@ class MqttWatcher(
                 isCleanSession = true
                 connectionTimeout = 10
                 keepAliveInterval = 30
+                if (!username.isNullOrBlank()) userName = username
+                if (password != null) this.password = password.toCharArray()
             }
             c.setCallback(object : MqttCallbackExtended {
                 override fun connectComplete(reconnect: Boolean, serverURI: String?) {

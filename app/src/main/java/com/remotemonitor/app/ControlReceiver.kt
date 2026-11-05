@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
+import androidx.core.content.ContextCompat
 
 class ControlReceiver : BroadcastReceiver() {
     companion object {
@@ -11,6 +12,17 @@ class ControlReceiver : BroadcastReceiver() {
         private const val TAG = "RM-Receiver"
     }
     override fun onReceive(context: Context, intent: Intent?) {
+        when (intent?.action) {
+            Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> {
+                Log.i(TAG, "Boot/update received, starting MonitorService")
+                try {
+                    ContextCompat.startForegroundService(context, Intent(context, MonitorService::class.java))
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to start service on boot/replace", e)
+                }
+                return
+            }
+        }
         if (intent?.action != ACTION) return
         val raw = intent.getStringExtra("payload") ?: intent.getStringExtra("json") ?: return
         Log.i(TAG, "Broadcast payload received (${raw.length} chars)")
