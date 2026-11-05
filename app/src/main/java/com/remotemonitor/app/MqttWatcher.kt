@@ -39,6 +39,18 @@ class MqttWatcher(
         start()
     }
 
+    /** Publishes a message to the given MQTT topic (e.g. a STATUS reply), if currently connected. */
+    fun publish(topic: String, message: String) {
+        try {
+            val c = client
+            if (c != null && c.isConnected) {
+                c.publish(topic, MqttMessage(message.toByteArray(Charsets.UTF_8)).apply { qos = 1 })
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Status publish failed: ${e.message}")
+        }
+    }
+
     private fun connect() {
         if (!running) return
         var rawUrl = AppConfig.mqttUrl(ctx).trim()
@@ -61,7 +73,11 @@ class MqttWatcher(
                     val parts = userInfo.split(":", limit = 2)
                     username = parts.getOrNull(0)
                     password = parts.getOrNull(1)
-                    rawUrl = "${uri.scheme}://${uri.host}:${uri.port}${uri.path ?: ""}"
+                    // uri.port is -1 when the URL omitted an explicit port (e.g. "ssl://user:pass@host"),
+                    // which would otherwise produce an invalid "...:-1" address; fall back to the
+                    // scheme's conventional MQTT port in that case.
+                    val port = if (uri.port > 0) uri.port else if (uri.scheme.equals("ssl", ignoreCase = true)) 8883 else 1883
+                    rawUrl = "${uri.scheme}://${uri.host}:${port}${uri.path ?: ""}"
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "MQTT URL parse warning: ${e.message}")

@@ -29,6 +29,11 @@ class MainActivity : AppCompatActivity() {
     private var dimmed = false
     // null = automatic (dim only while STREAMING); non-null = explicit user override
     private var manualDim: Boolean? = null
+    // true when manualDim was set by the user touching the screen to wake it during a
+    // STREAMING session (as opposed to an explicit "Dim mode" button press); cleared once
+    // that session ends so the NEXT stream still auto-dims instead of staying stuck awake.
+    private var wokeByTouch = false
+    private var lastState: MonitorState = MonitorState.IDLE
 
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -73,6 +78,7 @@ class MainActivity : AppCompatActivity() {
         root.setOnTouchListener { _, event ->
             if (event.action == MotionEvent.ACTION_DOWN && dimmed) {
                 manualDim = false
+                wokeByTouch = true
                 applyDim(false)
             }
             false
@@ -127,6 +133,16 @@ class MainActivity : AppCompatActivity() {
     private fun refreshUi() {
         val svc = MonitorService.instance
         val state = MonitorBus.state
+
+        // A touch-wake during STREAMING is meant to light up the screen for the current
+        // session only; once that session ends, restore automatic dimming so the next
+        // stream still goes dark instead of staying awake forever.
+        if (wokeByTouch && lastState == MonitorState.STREAMING && state != MonitorState.STREAMING) {
+            manualDim = null
+            wokeByTouch = false
+        }
+        lastState = state
+
         tvStatus.text = state.name
         val details = buildString {
             if (svc != null) {

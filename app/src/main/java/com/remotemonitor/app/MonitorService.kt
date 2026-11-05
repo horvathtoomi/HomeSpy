@@ -57,8 +57,11 @@ class MonitorService : Service(), ConnectChecker {
     private var ntfyWatcher: NtfyWatcher? = null
     private var mqttWatcher: MqttWatcher? = null
 
+    // Ntfy sends a keepalive roughly every ~45-55s; a bounded read timeout (instead of
+    // infinite) lets OkHttp detect a silently-dropped mobile/NAT connection quickly via a
+    // read timeout + onFailure/reconnect, rather than hanging for hours on a half-open socket.
     private val sseClient = OkHttpClient.Builder()
-        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
 
@@ -119,7 +122,7 @@ class MonitorService : Service(), ConnectChecker {
                 when (payload.action) {
                     "START" -> handleStart(payload)
                     "STOP" -> handleStop("remote STOP")
-                    "STATUS" -> { /* state returned via API; no-op */ }
+                    "STATUS" -> publishStatusReply()
                     else -> MonitorBus.lastError = "Unknown action: ${payload.action}"
                 }
             }
@@ -175,6 +178,18 @@ class MonitorService : Service(), ConnectChecker {
         MonitorBus.lastError = reason
         MonitorBus.update(MonitorState.IDLE)
         Log.i(TAG, "Stopped: $reason")
+    }
+
+    /**
+     * STATUS requests arriving over ntfy/MQTT have no HTTP response channel to answer on
+     * (unlike /api/status), so publish the current status back out over whichever remote
+     * channel(s) are configured, letting a mobile-data-only admin get a reply.
+     */
+    private fun publishStatusReply() {
+        val json = statusJson().toString()
+        Log.i(TAG, "Publishing STATUS reply")
+        ntfyWatcher?.publish(json)
+        mqttWatcher?.publish("remotemonitor/status", json)
     }
 
     private fun scheduleWatchdog(durationSeconds: Long) {
@@ -306,9 +321,13 @@ class MonitorService : Service(), ConnectChecker {
     }
 
     private fun cleanupStreamers() {
-        try { rtspServer?.let { if (it.isStreaming) it.stopStream(); it.stopPreview() } } catch (_: Exception) {}
-        try { rtspClient?.let { if (it.isStreaming) it.stopStream(); it.stopPreview() } } catch (_: Exception) {}
-        try { rtmpClient?.let { if (it.isStreaming) it.stopStream(); it.stopPreview() } } catch (_: Exception) {}
+        // Always call stopStream() unconditionally: for RtspServerCamera2 in particular,
+        // isStreaming only turns true once a viewer actually connects, so gating on it
+        // left the server's listening socket on :8554 bound forever when no viewer ever
+        // connected before STOP/duration-expiry, causing the next START to fail to bind.
+        try { rtspServer?.let { it.stopStream(); it.stopPreview() } } catch (_: Exception) {}
+        try { rtspClient?.let { it.stopStream(); it.stopPreview() } } catch (_: Exception) {}
+        try { rtmpClient?.let { it.stopStream(); it.stopPreview() } } catch (_: Exception) {}
         rtspServer = null
         rtspClient = null
         rtmpClient = null
@@ -460,6 +479,13 @@ class MonitorService : Service(), ConnectChecker {
     override fun onConnectionFailed(reason: String) {
         Log.e(TAG, "Connection failed: $reason")
         MonitorBus.lastError = "Connection failed: $reason"
+        if (rtspServer != null) {
+            // Built-in RTSP server mode: a single viewer failing auth or dropping its
+            // connection must not tear down the whole broadcast server for other viewers.
+            Log.w(TAG, "Ignoring viewer connection failure in server mode: $reason")
+            return
+        }
+        // Push client mode (RTMP/RTSP target): our own outgoing connection failed, so stop.
         scope.launch { mutex.withLock { if (MonitorBus.state == MonitorState.STREAMING) handleStop("connection failed") } }
     }
     override fun onDisconnect() { Log.i(TAG, "Disconnected") }

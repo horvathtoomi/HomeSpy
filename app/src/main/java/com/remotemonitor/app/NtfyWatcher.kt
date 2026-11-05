@@ -2,13 +2,18 @@ package com.remotemonitor.app
 
 import android.content.Context
 import android.util.Log
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
 import org.json.JSONObject
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
@@ -40,6 +45,23 @@ class NtfyWatcher(
         stop()
         backoffMs = 1000L
         start()
+    }
+
+    /** Publishes a plain-text message to the configured ntfy topic (e.g. a STATUS reply). */
+    fun publish(message: String) {
+        val topic = AppConfig.ntfyTopic(ctx)
+        if (topic.isBlank()) return
+        val url = "https://ntfy.sh/$topic"
+        val body = message.toRequestBody("text/plain; charset=utf-8".toMediaType())
+        val req = Request.Builder().url(url).post(body).build()
+        client.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.w(TAG, "Status publish failed: ${e.message}")
+            }
+            override fun onResponse(call: Call, response: Response) {
+                response.close()
+            }
+        })
     }
 
     private fun connect() {
