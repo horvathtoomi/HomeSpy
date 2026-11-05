@@ -15,6 +15,8 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
         val method = session.method
         return try {
             when {
+                method == Method.GET && (uri == "/" || uri == "/index.html") ->
+                    newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", DashboardHtml.CONTENT)
                 method == Method.POST && uri == "/api/control" -> handleControl(session)
                 method == Method.GET && uri == "/api/status" -> handleStatus(session)
                 method == Method.GET && uri == "/health" -> newFixedLengthResponse(Response.Status.OK, "application/json", """{"ok":true}""")
@@ -46,6 +48,8 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
             put("ok", true)
             put("accepted", payload.action)
             put("state", MonitorBus.state.name)
+            put("torch_active", MonitorBus.torchActive)
+            put("camera", MonitorBus.activePayload?.camera ?: "")
         }
         return json(Response.Status.OK, accepted.toString())
     }

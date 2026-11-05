@@ -57,11 +57,8 @@ class MonitorService : Service(), ConnectChecker {
     private var ntfyWatcher: NtfyWatcher? = null
     private var mqttWatcher: MqttWatcher? = null
 
-    // Ntfy sends a keepalive roughly every ~45-55s; a bounded read timeout (instead of
-    // infinite) lets OkHttp detect a silently-dropped mobile/NAT connection quickly via a
-    // read timeout + onFailure/reconnect, rather than hanging for hours on a half-open socket.
     private val sseClient = OkHttpClient.Builder()
-        .readTimeout(90, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS)
         .retryOnConnectionFailure(true)
         .build()
 
@@ -115,18 +112,76 @@ class MonitorService : Service(), ConnectChecker {
             Log.w(TAG, "Rejected payload: invalid auth token (count=${MonitorBus.failedAuthCount})")
             return
         }
-        // Callers (e.g. ControlApiServer via runBlocking on a NanoHTTPD worker thread) may invoke
-        // this off the main thread; camera/encoder calls must still happen on the main looper.
         withContext(Dispatchers.Main.immediate) {
             mutex.withLock {
                 when (payload.action) {
                     "START" -> handleStart(payload)
                     "STOP" -> handleStop("remote STOP")
                     "STATUS" -> publishStatusReply()
+                    "SWITCH_CAMERA" -> handleSwitchCamera()
+                    "TORCH_ON" -> handleTorch(true)
+                    "TORCH_OFF" -> handleTorch(false)
                     else -> MonitorBus.lastError = "Unknown action: ${payload.action}"
                 }
             }
             updateNotification(MonitorBus.state.name)
+        }
+    }
+
+    private fun activeStreamer(): Camera2Base? = rtspServer ?: rtspClient ?: rtmpClient
+
+    private fun handleSwitchCamera() {
+        if (MonitorBus.state != MonitorState.STREAMING) {
+            MonitorBus.lastError = "Cannot switch camera: not streaming"
+            Log.w(TAG, MonitorBus.lastError)
+            return
+        }
+        val streamer = activeStreamer() ?: run {
+            MonitorBus.lastError = "No active streamer"
+            Log.w(TAG, MonitorBus.lastError)
+            return
+        }
+        try {
+            streamer.switchCamera()
+            val newFacing = if (streamer.cameraFacing == CameraHelper.Facing.FRONT) "FRONT" else "BACK"
+            MonitorBus.activePayload = MonitorBus.activePayload?.copy(camera = newFacing)
+            if (newFacing == "FRONT" && MonitorBus.torchActive) {
+                try { streamer.disableLantern() } catch (_: Exception) {}
+                MonitorBus.torchActive = false
+            }
+            Log.i(TAG, "Switched camera to $newFacing")
+            publishStatusReply()
+        } catch (e: Exception) {
+            Log.e(TAG, "switchCamera error", e)
+            MonitorBus.lastError = "switchCamera error: ${e.message}"
+        }
+    }
+
+    private fun handleTorch(enable: Boolean) {
+        if (MonitorBus.state != MonitorState.STREAMING) {
+            MonitorBus.lastError = "Cannot toggle torch: not streaming"
+            Log.w(TAG, MonitorBus.lastError)
+            return
+        }
+        val streamer = activeStreamer() ?: run {
+            MonitorBus.lastError = "No active streamer"
+            Log.w(TAG, MonitorBus.lastError)
+            return
+        }
+        try {
+            if (enable) {
+                streamer.enableLantern()
+                MonitorBus.torchActive = true
+                Log.i(TAG, "Torch enabled")
+            } else {
+                streamer.disableLantern()
+                MonitorBus.torchActive = false
+                Log.i(TAG, "Torch disabled")
+            }
+            publishStatusReply()
+        } catch (e: Exception) {
+            Log.e(TAG, "Torch toggle error (enable=$enable)", e)
+            MonitorBus.lastError = "Torch toggle error: ${e.message}"
         }
     }
 
@@ -148,8 +203,17 @@ class MonitorService : Service(), ConnectChecker {
             if (ok) {
                 acquireStreamingLocks()
                 MonitorBus.update(MonitorState.STREAMING)
+                if (payload.mode != "AUDIO_ONLY" && payload.torch && payload.camera != "FRONT") {
+                    try {
+                        activeStreamer()?.enableLantern()
+                        MonitorBus.torchActive = true
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to enable torch on start: ${e.message}")
+                    }
+                }
                 scheduleWatchdog(payload.durationSeconds)
-                Log.i(TAG, "Streaming started: mode=${payload.mode} target=${MonitorBus.streamUrl}")
+                Log.i(TAG, "Streaming started: mode=${payload.mode} target=${MonitorBus.streamUrl} bitrate=${payload.videoBitrateKbps}k fps=${payload.fps}")
+                publishStatusReply()
             } else {
                 MonitorBus.lastError = "Failed to prepare/start stream"
                 cleanupStreamers()
@@ -169,6 +233,12 @@ class MonitorService : Service(), ConnectChecker {
         MonitorBus.update(MonitorState.STOPPING)
         watchdogJob?.cancel()
         watchdogJob = null
+        try {
+            if (MonitorBus.torchActive) {
+                activeStreamer()?.disableLantern()
+            }
+        } catch (_: Exception) {}
+        MonitorBus.torchActive = false
         cleanupStreamers()
         releaseStreamingLocks()
         MonitorBus.activePayload = null
@@ -178,18 +248,16 @@ class MonitorService : Service(), ConnectChecker {
         MonitorBus.lastError = reason
         MonitorBus.update(MonitorState.IDLE)
         Log.i(TAG, "Stopped: $reason")
+        publishStatusReply()
     }
 
-    /**
-     * STATUS requests arriving over ntfy/MQTT have no HTTP response channel to answer on
-     * (unlike /api/status), so publish the current status back out over whichever remote
-     * channel(s) are configured, letting a mobile-data-only admin get a reply.
-     */
-    private fun publishStatusReply() {
-        val json = statusJson().toString()
-        Log.i(TAG, "Publishing STATUS reply")
-        ntfyWatcher?.publish(json)
-        mqttWatcher?.publish("remotemonitor/status", json)
+    fun publishStatusReply() {
+        scope.launch(Dispatchers.IO) {
+            val json = statusJson().toString()
+            Log.i(TAG, "Publishing status to remote channels")
+            ntfyWatcher?.publishStatus(json)
+            mqttWatcher?.publishStatus(json)
+        }
     }
 
     private fun scheduleWatchdog(durationSeconds: Long) {
@@ -215,6 +283,9 @@ class MonitorService : Service(), ConnectChecker {
             else -> 1280 to 720
         }
 
+        val bitrateBps = payload.videoBitrateKbps * 1024
+        val fps = payload.fps
+
         return if (useServer) {
             val server = RtspServerCamera2(this, this, 8554)
             rtspServer = server
@@ -228,7 +299,7 @@ class MonitorService : Service(), ConnectChecker {
                 audioOk = server.prepareAudio(64 * 1024, 32000, true, false, false)
             }
             if (!isAudioOnly) {
-                videoOk = server.prepareVideo(w, h, 30, 1500 * 1024, 0, 90)
+                videoOk = server.prepareVideo(w, h, fps, bitrateBps, 0, 90)
             }
 
             if (isAudioOnly && !audioOk) return false
@@ -254,11 +325,11 @@ class MonitorService : Service(), ConnectChecker {
         } else if (target.startsWith("rtmp", true)) {
             val client = RtmpCamera2(this, this)
             rtmpClient = client
-            startClient(client, client.getStreamClient(), target, isAudioOnly, isVideoOnly, isBack, w, h)
+            startClient(client, client.getStreamClient(), target, isAudioOnly, isVideoOnly, isBack, w, h, fps, bitrateBps)
         } else {
             val client = RtspCamera2(this, this)
             rtspClient = client
-            startClient(client, client.getStreamClient(), target, isAudioOnly, isVideoOnly, isBack, w, h)
+            startClient(client, client.getStreamClient(), target, isAudioOnly, isVideoOnly, isBack, w, h, fps, bitrateBps)
         }
     }
 
@@ -270,7 +341,9 @@ class MonitorService : Service(), ConnectChecker {
         isVideoOnly: Boolean,
         isBack: Boolean,
         w: Int,
-        h: Int
+        h: Int,
+        fps: Int,
+        bitrateBps: Int
     ): Boolean {
         var audioOk = true
         var videoOk = true
@@ -279,7 +352,7 @@ class MonitorService : Service(), ConnectChecker {
             audioOk = client.prepareAudio(64 * 1024, 32000, true, false, false)
         }
         if (!isAudioOnly) {
-            videoOk = client.prepareVideo(w, h, 30, 1500 * 1024, 0, 90)
+            videoOk = client.prepareVideo(w, h, fps, bitrateBps, 0, 90)
         }
 
         if (isAudioOnly && !audioOk) return false
@@ -303,10 +376,6 @@ class MonitorService : Service(), ConnectChecker {
         return true
     }
 
-    /**
-     * Surface-less Camera2Base sessions don't always honor the requested facing on
-     * startPreview(); verify the active camera matches the request and switch if not.
-     */
     private fun ensureCameraFacing(client: Camera2Base, isBack: Boolean, isAudioOnly: Boolean) {
         if (isAudioOnly) return
         try {
@@ -321,10 +390,6 @@ class MonitorService : Service(), ConnectChecker {
     }
 
     private fun cleanupStreamers() {
-        // Always call stopStream() unconditionally: for RtspServerCamera2 in particular,
-        // isStreaming only turns true once a viewer actually connects, so gating on it
-        // left the server's listening socket on :8554 bound forever when no viewer ever
-        // connected before STOP/duration-expiry, causing the next START to fail to bind.
         try { rtspServer?.let { it.stopStream(); it.stopPreview() } } catch (_: Exception) {}
         try { rtspClient?.let { it.stopStream(); it.stopPreview() } } catch (_: Exception) {}
         try { rtmpClient?.let { it.stopStream(); it.stopPreview() } } catch (_: Exception) {}
@@ -347,6 +412,9 @@ class MonitorService : Service(), ConnectChecker {
         put("ends_at_ms", MonitorBus.endsAtMs)
         put("last_error", MonitorBus.lastError)
         put("failed_auth_count", MonitorBus.failedAuthCount)
+        put("torch_active", MonitorBus.torchActive)
+        put("video_bitrate_kbps", MonitorBus.activePayload?.videoBitrateKbps ?: 1500)
+        put("fps", MonitorBus.activePayload?.fps ?: 30)
         put("overlay_allowed", Settings.canDrawOverlays(this@MonitorService))
         put("ntfy_topic_configured", AppConfig.ntfyTopic(this@MonitorService).isNotBlank())
         put("mqtt_configured", AppConfig.mqttUrl(this@MonitorService).isNotBlank())
@@ -382,7 +450,7 @@ class MonitorService : Service(), ConnectChecker {
         if (vpn.isNotBlank()) return vpn
         val wifi = getInterfaceIp("wlan0")
         if (wifi.isNotBlank()) return wifi
-        return all.firstOrNull { it.startsWith("100.") } // tailscale
+        return all.firstOrNull { it.startsWith("100.") }
             ?: all.firstOrNull { it.startsWith("192.168.") }
             ?: all.firstOrNull { it.startsWith("10.") }
             ?: all.firstOrNull() ?: "0.0.0.0"
@@ -409,6 +477,7 @@ class MonitorService : Service(), ConnectChecker {
 
             if (wifiLock == null) {
                 val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                @Suppress("DEPRECATION")
                 wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "remotemonitor:streaming_wifilock").apply {
                     setReferenceCounted(false)
                 }
@@ -462,6 +531,7 @@ class MonitorService : Service(), ConnectChecker {
         MonitorBus.streamUrl = ""
         MonitorBus.startedAtMs = 0L
         MonitorBus.endsAtMs = 0L
+        MonitorBus.torchActive = false
         MonitorBus.update(MonitorState.IDLE)
         try { apiServer?.stop() } catch (_: Exception) {}
         ntfyWatcher?.stop()
@@ -480,12 +550,9 @@ class MonitorService : Service(), ConnectChecker {
         Log.e(TAG, "Connection failed: $reason")
         MonitorBus.lastError = "Connection failed: $reason"
         if (rtspServer != null) {
-            // Built-in RTSP server mode: a single viewer failing auth or dropping its
-            // connection must not tear down the whole broadcast server for other viewers.
             Log.w(TAG, "Ignoring viewer connection failure in server mode: $reason")
             return
         }
-        // Push client mode (RTMP/RTSP target): our own outgoing connection failed, so stop.
         scope.launch { mutex.withLock { if (MonitorBus.state == MonitorState.STREAMING) handleStop("connection failed") } }
     }
     override fun onDisconnect() { Log.i(TAG, "Disconnected") }

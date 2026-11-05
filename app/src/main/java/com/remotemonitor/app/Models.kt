@@ -51,18 +51,37 @@ data class ControlPayload(
     val camera: String = "BACK",
     val videoResolution: String = "720p",
     val durationSeconds: Long = 0,
-    val streamTarget: String = ""
+    val streamTarget: String = "",
+    val torch: Boolean = false,
+    val videoBitrateKbps: Int = 1500,
+    val fps: Int = 30
 ) {
     companion object {
-        fun fromJson(obj: JSONObject): ControlPayload = ControlPayload(
-            authToken = obj.optString("auth_token", ""),
-            action = obj.optString("action", "STATUS").uppercase(),
-            mode = obj.optString("mode", "BOTH").uppercase(),
-            camera = obj.optString("camera", "BACK").uppercase(),
-            videoResolution = obj.optString("video_Resolution", obj.optString("video_resolution", "720p")),
-            durationSeconds = obj.optLong("duration_seconds", 0),
-            streamTarget = obj.optString("stream_target", "")
-        )
+        fun fromJson(obj: JSONObject): ControlPayload {
+            val rawBitrate = if (obj.has("video_bitrate_kbps")) {
+                obj.optInt("video_bitrate_kbps", 1500)
+            } else {
+                obj.optInt("videoBitrateKbps", 1500)
+            }
+            val bitrateClamped = rawBitrate.coerceIn(200, 8000)
+
+            val rawFps = obj.optInt("fps", 30)
+            val fpsClamped = rawFps.coerceIn(10, 60)
+
+            return ControlPayload(
+                authToken = obj.optString("auth_token", ""),
+                action = obj.optString("action", "STATUS").uppercase(),
+                mode = obj.optString("mode", "BOTH").uppercase(),
+                camera = obj.optString("camera", "BACK").uppercase(),
+                videoResolution = obj.optString("video_Resolution", obj.optString("video_resolution", "720p")),
+                durationSeconds = obj.optLong("duration_seconds", 0),
+                streamTarget = obj.optString("stream_target", ""),
+                torch = obj.optBoolean("torch", false),
+                videoBitrateKbps = bitrateClamped,
+                fps = fpsClamped
+            )
+        }
+
         fun parse(raw: String): ControlPayload? = try {
             fromJson(JSONObject(raw))
         } catch (_: Exception) { null }
@@ -77,6 +96,7 @@ object MonitorBus {
     @Volatile var lastError: String = ""
     @Volatile var streamUrl: String = ""
     @Volatile var failedAuthCount: Int = 0
+    @Volatile var torchActive: Boolean = false
     var onStateChanged: ((MonitorState) -> Unit)? = null
 
     fun snapshot(): JSONObject = JSONObject().apply {
@@ -89,6 +109,9 @@ object MonitorBus {
         put("remaining_seconds", remainingSeconds())
         put("last_error", lastError)
         put("failed_auth_count", failedAuthCount)
+        put("torch_active", torchActive)
+        put("video_bitrate_kbps", activePayload?.videoBitrateKbps ?: 1500)
+        put("fps", activePayload?.fps ?: 30)
     }
 
     fun remainingSeconds(): Long {

@@ -40,6 +40,9 @@ All control channels accept the following JSON payload:
   "mode": "BOTH",
   "camera": "BACK",
   "video_Resolution": "720p",
+  "video_bitrate_kbps": 1500,
+  "fps": 30,
+  "torch": false,
   "duration_seconds": 3600,
   "stream_target": "rtsp://my-server:8554/live"
 }
@@ -50,18 +53,25 @@ All control channels accept the following JSON payload:
 | Field | Type | Values | Description |
 |---|---|---|---|
 | `auth_token` | `string` | any | Plaintext token or its SHA-256 hash. Must match the configured token. |
-| `action` | `string` | `"START"`, `"STOP"`, `"STATUS"` | Command action to execute. |
+| `action` | `string` | `"START"`, `"STOP"`, `"STATUS"`, `"SWITCH_CAMERA"`, `"TORCH_ON"`, `"TORCH_OFF"` | Command action to execute. |
 | `mode` | `string` | `"BOTH"`, `"AUDIO_ONLY"`, `"VIDEO_ONLY"` | Stream capture mode. |
 | `camera` | `string` | `"BACK"`, `"FRONT"` | Selected camera sensor. |
 | `video_Resolution` | `string` | `"720p"`, `"1080p"`, `"480p"` | Video resolution preset. |
+| `video_bitrate_kbps` | `number` | integer (`200..8000`, default `1500`) | Video encoder bitrate in Kbps. |
+| `fps` | `number` | integer (`10..60`, default `30`) | Video encoder frame rate. |
+| `torch` | `boolean` | `true`, `false` | Enable/disable rear LED flashlight. |
 | `duration_seconds` | `number` | integer (`0` = indefinite) | Auto-stop watchdog timeout in seconds. |
 | `stream_target` | `string` | URL or `""` | Target URL for Push mode (`rtsp://`, `rtmp://`). If empty (`""`), launches built-in RTSP server on `:8554`. |
 
 ---
 
-## API Endpoints (Port 5000)
+## Web Dashboard & API Endpoints (Port 5000)
 
-### 1. Send Command: `POST /api/control`
+### 1. Web Dashboard: `GET /`
+- Access via any modern browser at `http://<phone_ip>:5000/`.
+- Features a responsive, dark-themed HTML5/JS control panel with live 2s polling of device status, token storage in `localStorage`, stream settings controls, and one-click action buttons (**START**, **STOP**, **Switch Camera**, **Torch ON/OFF**).
+
+### 2. Send Command: `POST /api/control`
 - **Headers:** `Content-Type: application/json`
 - **Body:** Control payload JSON.
 - **Response:**

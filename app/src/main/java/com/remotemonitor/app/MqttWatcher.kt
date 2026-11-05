@@ -51,6 +51,11 @@ class MqttWatcher(
         }
     }
 
+    /** Publishes status JSON to remotemonitor/status */
+    fun publishStatus(json: String) {
+        publish("remotemonitor/status", json)
+    }
+
     private fun connect() {
         if (!running) return
         var rawUrl = AppConfig.mqttUrl(ctx).trim()

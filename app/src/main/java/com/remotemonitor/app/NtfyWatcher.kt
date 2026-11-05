@@ -64,6 +64,23 @@ class NtfyWatcher(
         })
     }
 
+    /** Publishes JSON status to https://ntfy.sh/${topic}-status */
+    fun publishStatus(json: String) {
+        val topic = AppConfig.ntfyTopic(ctx).trim()
+        if (topic.isBlank()) return
+        val url = "https://ntfy.sh/${topic}-status"
+        val body = json.toRequestBody("application/json; charset=utf-8".toMediaType())
+        val req = Request.Builder().url(url).post(body).build()
+        client.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.w(TAG, "Status publish to $url failed: ${e.message}")
+            }
+            override fun onResponse(call: Call, response: Response) {
+                response.close()
+            }
+        })
+    }
+
     private fun connect() {
         if (!running) return
         val topic = AppConfig.ntfyTopic(ctx)
