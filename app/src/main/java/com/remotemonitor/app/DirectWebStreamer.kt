@@ -1,6 +1,8 @@
 package com.remotemonitor.app
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
@@ -8,7 +10,9 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.Image
 import android.media.MediaRecorder
+import android.util.Base64
 import android.util.Log
+import org.json.JSONObject
 import com.pedro.encoder.input.video.Camera2ApiManager
 import com.pedro.library.base.Camera2Base
 import okhttp3.MediaType.Companion.toMediaType
@@ -42,8 +46,12 @@ class DirectWebStreamer(
         private const val TAG = "RM-WebStreamer"
         private const val SAMPLE_RATE = 16000
         private const val JPEG_QUALITY = 70
-        private const val MIN_CAPTURE_INTERVAL_MS = 150L
         private val STREAM_END = ByteArray(0)
+        // ~5s of 16kHz mono 16-bit PCM, backing the /api/live_pack NAT-traversal endpoint.
+        private const val PACK_AUDIO_MAX_BYTES = SAMPLE_RATE * 2 * 5
+        // Safety cap for the ntfy push buffer in case pushes stall for a while — drop the
+        // oldest half rather than grow unbounded.
+        private const val NTFY_AUDIO_MAX_BYTES = SAMPLE_RATE * 2 * 10
     }
 
     @Volatile var latestJpeg: ByteArray? = null
@@ -65,36 +73,70 @@ class DirectWebStreamer(
     private val audioClients = CopyOnWriteArrayList<LinkedBlockingQueue<ByteArray>>()
     private val mjpegClients = CopyOnWriteArrayList<LinkedBlockingQueue<ByteArray>>()
 
+    private val packLock = Object()
+    private var packAudioBuffer = ByteArray(0)
+
+    // Dedicated consume-on-read buffer for the ntfy relay push, separate from packAudioBuffer
+    // (a rolling "last 5s" window used by the pull-based /api/live_pack endpoint). Pushing the
+    // same rolling window out every cycle would resend already-heard audio as an echo; this one
+    // is drained to empty on every read so each push only ever carries audio captured since the
+    // previous push.
+    @Volatile private var ntfyPushActive = false
+    private val ntfyAudioLock = Object()
+    private var ntfyAudioBuffer = ByteArrayOutputStream()
+
     private val imageCallback = object : Camera2ApiManager.ImageCallback {
         override fun onImageAvailable(image: Image) {
             try {
                 val now = System.currentTimeMillis()
-                if (now - lastCaptureMs < MIN_CAPTURE_INTERVAL_MS) return
+                // Respect the caller's configured snapshot interval instead of a fixed 150ms
+                // floor — at the default 1000ms interval the old fixed value ran the (fairly
+                // heavy) YUV->JPEG conversion ~7x more often than anything ever consumed, on
+                // the Camera2 callback thread itself. Still cap it at 400ms so a very slow
+                // configured interval doesn't starve the MJPEG stream of frames.
+                val minInterval = minOf(captureIntervalMs, 400L)
+                if (now - lastCaptureMs < minInterval) {
+                    image.close()
+                    return
+                }
                 lastCaptureMs = now
-                val jpeg = when (image.format) {
+                when (image.format) {
                     ImageFormat.JPEG -> {
                         val buffer = image.planes[0].buffer
                         val bytes = ByteArray(buffer.remaining())
                         buffer.get(bytes)
-                        bytes
+                        image.close()
+                        publishJpeg(bytes, now)
                     }
-                    ImageFormat.YUV_420_888 -> yuv420888ToJpeg(image, JPEG_QUALITY)
+                    ImageFormat.YUV_420_888 -> {
+                        // Copying the raw plane bytes is cheap; the actual YUV->JPEG
+                        // compression is not. Do the copy here so image.close() can run
+                        // immediately and free the Camera2 pipeline's buffer slot, then
+                        // compress on a background thread instead of blocking the capture
+                        // callback thread.
+                        val snapshot = copyYuvPlanes(image)
+                        image.close()
+                        thread(name = "RM-JpegEncode") {
+                            val jpeg = yuv420888ToJpeg(snapshot, JPEG_QUALITY)
+                            if (jpeg != null) publishJpeg(jpeg, now)
+                        }
+                    }
                     else -> {
                         Log.w(TAG, "Unsupported image format for snapshot: ${image.format}")
-                        null
+                        image.close()
                     }
-                }
-                if (jpeg != null) {
-                    latestJpeg = jpeg
-                    latestJpegTimestampMs = now
-                    offerToClients(mjpegClients, jpeg)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "image callback error: ${e.message}")
-            } finally {
                 try { image.close() } catch (_: Exception) {}
             }
         }
+    }
+
+    private fun publishJpeg(jpeg: ByteArray, atMs: Long) {
+        latestJpeg = jpeg
+        latestJpegTimestampMs = atMs
+        offerToClients(mjpegClients, jpeg)
     }
 
     /** Begin serving snapshots/audio for the current streaming session. Call after the RootEncoder stream has started. */
@@ -104,6 +146,8 @@ class DirectWebStreamer(
         val isAudioOnly = mode == "AUDIO_ONLY"
         val isVideoOnly = mode == "VIDEO_ONLY"
         captureIntervalMs = payload.snapshotIntervalMs.coerceAtLeast(200L)
+        ntfyPushActive = payload.ntfyPushSnapshots
+        synchronized(ntfyAudioLock) { ntfyAudioBuffer.reset() }
 
         if (!isAudioOnly && cam != null) {
             camera = cam
@@ -131,15 +175,97 @@ class DirectWebStreamer(
         camera = null
         stopAudioCapture()
         pushRunning = false
+        ntfyPushActive = false
         pushThread?.interrupt()
         pushThread = null
         latestJpeg = null
         latestJpegTimestampMs = 0L
+        synchronized(packLock) { packAudioBuffer = ByteArray(0) }
+        synchronized(ntfyAudioLock) { ntfyAudioBuffer.reset() }
         closeAllClients(audioClients)
         closeAllClients(mjpegClients)
     }
 
+    /** Drains and returns everything captured since the last call — never resends the same audio twice. */
+    private fun consumeNtfyAudioBytes(): ByteArray = synchronized(ntfyAudioLock) {
+        val bytes = ntfyAudioBuffer.toByteArray()
+        ntfyAudioBuffer.reset()
+        bytes
+    }
+
     fun snapshotBytes(): ByteArray? = latestJpeg
+
+    /**
+     * Single-request JSON snapshot for callers that can't hold a long-lived connection (e.g. a
+     * phone behind NAT being polled over a relay): the latest JPEG plus whatever PCM audio has
+     * accumulated since the ring buffer last wrapped, both base64-encoded.
+     */
+    fun livePackJson(): JSONObject {
+        val jpeg = latestJpeg
+        val audioBytes = synchronized(packLock) { packAudioBuffer.copyOf() }
+        return JSONObject().apply {
+            put("timestamp_ms", System.currentTimeMillis())
+            put("jpeg_timestamp_ms", latestJpegTimestampMs)
+            put("jpeg_base64", if (jpeg != null) Base64.encodeToString(jpeg, Base64.NO_WRAP) else "")
+            put("audio_wav_base64", if (audioBytes.isNotEmpty()) Base64.encodeToString(buildStandaloneWav(audioBytes), Base64.NO_WRAP) else "")
+        }
+    }
+
+    private fun buildStandaloneWav(pcm: ByteArray): ByteArray = buildWav(pcm, SAMPLE_RATE, 16)
+
+    private fun buildWav(pcm: ByteArray, sampleRate: Int, bitsPerSample: Int): ByteArray {
+        val channels = 1
+        val byteRate = sampleRate * channels * bitsPerSample / 8
+        val blockAlign = channels * bitsPerSample / 8
+        val dataSize = pcm.size
+
+        val out = ByteArrayOutputStream(44 + dataSize)
+        fun writeStr(s: String) = out.write(s.toByteArray(Charsets.US_ASCII))
+        fun writeIntLE(v: Int) {
+            out.write(v and 0xFF)
+            out.write((v shr 8) and 0xFF)
+            out.write((v shr 16) and 0xFF)
+            out.write((v shr 24) and 0xFF)
+        }
+        fun writeShortLE(v: Int) {
+            out.write(v and 0xFF)
+            out.write((v shr 8) and 0xFF)
+        }
+        writeStr("RIFF"); writeIntLE(36 + dataSize); writeStr("WAVE")
+        writeStr("fmt "); writeIntLE(16)
+        writeShortLE(1) // PCM
+        writeShortLE(channels)
+        writeIntLE(sampleRate)
+        writeIntLE(byteRate)
+        writeShortLE(blockAlign)
+        writeShortLE(bitsPerSample)
+        writeStr("data"); writeIntLE(dataSize)
+        out.write(pcm)
+        return out.toByteArray()
+    }
+
+    /**
+     * 16kHz/16-bit mono PCM -> 8kHz/8-bit mono PCM: drops every other sample and the low byte
+     * of what's left. ~8KB/s instead of ~32KB/s, small enough to embed as base64 directly in an
+     * ntfy JSON text message instead of needing a second HTTP request as a binary attachment.
+     */
+    private fun downsampleTo8kHz8Bit(pcm16: ByteArray): ByteArray {
+        val sampleCount = pcm16.size / 2
+        val outCount = sampleCount / 2
+        if (outCount <= 0) return ByteArray(0)
+        val out = ByteArray(outCount)
+        var i = 0
+        var o = 0
+        while (o < outCount) {
+            val lo = pcm16[i].toInt() and 0xFF
+            val hi = pcm16[i + 1].toInt()
+            val sample16 = (hi shl 8) or lo
+            out[o] = ((sample16 shr 8) + 128).coerceIn(0, 255).toByte()
+            o++
+            i += 4 // consume 2 samples (4 bytes), keep 1 -> 16kHz to 8kHz
+        }
+        return out
+    }
 
     /** Registers a new subscriber and returns a blocking InputStream: a WAV header followed by continuous PCM. */
     fun newAudioStream(): InputStream {
@@ -183,7 +309,25 @@ class DirectWebStreamer(
                 while (audioRunning) {
                     val n = try { rec.read(chunk, 0, chunk.size) } catch (e: Exception) { -1 }
                     if (n > 0) {
-                        offerToClients(audioClients, chunk.copyOf(n))
+                        val piece = chunk.copyOf(n)
+                        offerToClients(audioClients, piece)
+                        synchronized(packLock) {
+                            val combined = packAudioBuffer + piece
+                            packAudioBuffer = if (combined.size > PACK_AUDIO_MAX_BYTES) {
+                                combined.copyOfRange(combined.size - PACK_AUDIO_MAX_BYTES, combined.size)
+                            } else combined
+                        }
+                        if (ntfyPushActive) {
+                            synchronized(ntfyAudioLock) {
+                                ntfyAudioBuffer.write(piece)
+                                if (ntfyAudioBuffer.size() > NTFY_AUDIO_MAX_BYTES) {
+                                    val trimmed = ntfyAudioBuffer.toByteArray()
+                                        .copyOfRange(ntfyAudioBuffer.size() - NTFY_AUDIO_MAX_BYTES / 2, ntfyAudioBuffer.size())
+                                    ntfyAudioBuffer.reset()
+                                    ntfyAudioBuffer.write(trimmed)
+                                }
+                            }
+                        }
                     } else if (n < 0) {
                         break
                     }
@@ -220,19 +364,70 @@ class DirectWebStreamer(
 
     private fun schedulePush(callbackUrl: String, pushToNtfy: Boolean, intervalMs: Long) {
         pushRunning = true
+        // The ntfy relay push is intentionally throttled to its own floor, independent of the
+        // (possibly much faster) local snapshot interval: it's talking to the public ntfy.sh
+        // broker over the internet, not polling localhost. A previous 2s floor still hit
+        // ntfy.sh's HTTP 429 rate limit after ~20s of a session, so this is now 4s.
+        val ntfyIntervalMs = maxOf(intervalMs, 4000L)
         pushThread = thread(name = "RM-SnapshotPush") {
+            var lastNtfyPushMs = 0L
             while (pushRunning) {
                 try {
                     val jpeg = latestJpeg
-                    if (jpeg != null) {
-                        if (callbackUrl.isNotBlank()) postCallback(callbackUrl, jpeg)
-                        if (pushToNtfy) ntfyWatcher?.publishSnapshot(jpeg)
+                    if (jpeg != null && callbackUrl.isNotBlank()) postCallback(callbackUrl, jpeg)
+                    val now = System.currentTimeMillis()
+                    if (pushToNtfy && now - lastNtfyPushMs >= ntfyIntervalMs) {
+                        lastNtfyPushMs = now
+                        // Deliberately not gated on jpeg != null: AUDIO_ONLY mode never has a
+                        // snapshot, but still needs its status/audio pushed every cycle.
+                        pushLivePackToNtfy(jpeg)
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "snapshot push error: ${e.message}")
                 }
                 try { Thread.sleep(intervalMs) } catch (_: InterruptedException) { break }
             }
+        }
+    }
+
+    /**
+     * Sends a compact live update over the ntfy relay as a SINGLE HTTP POST: status fields,
+     * an optional small downscaled JPEG, and an optional short 8kHz/8-bit WAV audio clip
+     * (only the PCM captured since the previous push — never resends the same audio), all
+     * embedded as base64 directly in the JSON message body. Two separate requests (a JSON
+     * POST plus a binary PUT attachment) used to trip ntfy.sh's attachment rate limit
+     * (HTTP 429) within ~20s of a session; one combined text message does not.
+     */
+    private fun pushLivePackToNtfy(fullJpeg: ByteArray?) {
+        try {
+            val svc = ctx as? MonitorService
+            val batteryPercent = svc?.statusJson()?.optInt("battery_percent", -1) ?: -1
+            val json = JSONObject().apply {
+                put("type", "live_pack")
+                put("state", MonitorBus.state.name)
+                put("battery_percent", batteryPercent)
+            }
+            if (fullJpeg != null) {
+                val smallJpeg = downscaleJpeg(fullJpeg, 320, 240, 45) ?: fullJpeg
+                json.put("jpeg_b64", Base64.encodeToString(smallJpeg, Base64.NO_WRAP))
+            }
+
+            val newPcm = consumeNtfyAudioBytes()
+            if (newPcm.isNotEmpty()) {
+                val compactPcm = downsampleTo8kHz8Bit(newPcm)
+                val wavB64 = Base64.encodeToString(buildWav(compactPcm, 8000, 8), Base64.NO_WRAP)
+                json.put("audio_wav_b64", wavB64)
+            }
+
+            var body = json.toString()
+            if (body.length > 28_000) {
+                Log.w(TAG, "live_pack JSON too large (${body.length} chars), dropping audio for this push")
+                json.remove("audio_wav_b64")
+                body = json.toString()
+            }
+            ntfyWatcher?.publishStatus(body)
+        } catch (e: Exception) {
+            Log.w(TAG, "pushLivePackToNtfy error: ${e.message}")
         }
     }
 
@@ -253,35 +448,56 @@ class DirectWebStreamer(
 
     // ---- YUV_420_888 -> JPEG ----
 
-    private fun yuv420888ToJpeg(image: Image, quality: Int): ByteArray? = try {
-        val width = image.width
-        val height = image.height
+    /** Plain-data copy of an Image's YUV planes, safe to hand to a background thread after the Image itself has been closed. */
+    private class YuvSnapshot(
+        val width: Int,
+        val height: Int,
+        val yBytes: ByteArray,
+        val uBytes: ByteArray,
+        val vBytes: ByteArray,
+        val uRowStride: Int,
+        val uPixelStride: Int,
+        val vRowStride: Int,
+        val vPixelStride: Int
+    )
+
+    private fun copyYuvPlanes(image: Image): YuvSnapshot {
         val yPlane = image.planes[0]
         val uPlane = image.planes[1]
         val vPlane = image.planes[2]
-
-        val ySize = yPlane.buffer.remaining()
-        val nv21 = ByteArray(ySize + width * height / 2)
-        yPlane.buffer.get(nv21, 0, ySize)
-
+        val yBuf = yPlane.buffer
+        val yBytes = ByteArray(yBuf.remaining())
+        yBuf.get(yBytes)
         val uBuf = uPlane.buffer
-        val vBuf = vPlane.buffer
         val uBytes = ByteArray(uBuf.remaining())
-        val vBytes = ByteArray(vBuf.remaining())
         uBuf.get(uBytes)
+        val vBuf = vPlane.buffer
+        val vBytes = ByteArray(vBuf.remaining())
         vBuf.get(vBytes)
+        return YuvSnapshot(
+            image.width, image.height, yBytes, uBytes, vBytes,
+            uPlane.rowStride, uPlane.pixelStride, vPlane.rowStride, vPlane.pixelStride
+        )
+    }
 
-        val chromaRowStride = vPlane.rowStride
-        val chromaPixelStride = vPlane.pixelStride
+    private fun yuv420888ToJpeg(snap: YuvSnapshot, quality: Int): ByteArray? = try {
+        val width = snap.width
+        val height = snap.height
+        val ySize = snap.yBytes.size
+        val nv21 = ByteArray(ySize + width * height / 2)
+        System.arraycopy(snap.yBytes, 0, nv21, 0, ySize)
+
+        val chromaRowStride = snap.vRowStride
+        val chromaPixelStride = snap.vPixelStride
         var offset = ySize
         val chromaHeight = height / 2
         val chromaWidth = width / 2
         for (row in 0 until chromaHeight) {
             for (col in 0 until chromaWidth) {
                 val vIndex = row * chromaRowStride + col * chromaPixelStride
-                val uIndex = row * uPlane.rowStride + col * uPlane.pixelStride
-                nv21[offset++] = if (vIndex < vBytes.size) vBytes[vIndex] else 0
-                nv21[offset++] = if (uIndex < uBytes.size) uBytes[uIndex] else 0
+                val uIndex = row * snap.uRowStride + col * snap.uPixelStride
+                nv21[offset++] = if (vIndex < snap.vBytes.size) snap.vBytes[vIndex] else 0
+                nv21[offset++] = if (uIndex < snap.uBytes.size) snap.uBytes[uIndex] else 0
             }
         }
 
@@ -291,6 +507,28 @@ class DirectWebStreamer(
         out.toByteArray()
     } catch (e: Exception) {
         Log.w(TAG, "yuv420888ToJpeg error: ${e.message}")
+        null
+    }
+
+    /** Downscales an existing JPEG to at most maxW x maxH at the given quality, for the compact ntfy relay live-pack push. */
+    private fun downscaleJpeg(src: ByteArray, maxW: Int, maxH: Int, quality: Int): ByteArray? = try {
+        val bmp = BitmapFactory.decodeByteArray(src, 0, src.size) ?: return null
+        val scale = minOf(maxW.toFloat() / bmp.width, maxH.toFloat() / bmp.height, 1f)
+        val outBmp = if (scale < 1f) {
+            Bitmap.createScaledBitmap(
+                bmp,
+                (bmp.width * scale).toInt().coerceAtLeast(1),
+                (bmp.height * scale).toInt().coerceAtLeast(1),
+                true
+            )
+        } else bmp
+        val out = ByteArrayOutputStream()
+        outBmp.compress(Bitmap.CompressFormat.JPEG, quality, out)
+        if (outBmp !== bmp) outBmp.recycle()
+        bmp.recycle()
+        out.toByteArray()
+    } catch (e: Exception) {
+        Log.w(TAG, "downscaleJpeg error: ${e.message}")
         null
     }
 

@@ -22,10 +22,14 @@ class NtfyWatcher(
     private val client: OkHttpClient,
     private val onPayload: (ControlPayload) -> Unit
 ) {
-    companion object { private const val TAG = "RM-Ntfy" }
+    companion object {
+        private const val TAG = "RM-Ntfy"
+        private const val KEY_LAST_EVENT_ID = "ntfy_last_event_id"
+    }
 
     @Volatile private var running = false
     @Volatile private var source: EventSource? = null
+    @Volatile private var connected = false
     private var backoffMs = 1000L
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
 
@@ -36,10 +40,14 @@ class NtfyWatcher(
 
     fun stop() {
         running = false
+        connected = false
         source?.cancel()
         source = null
         handler.removeCallbacksAndMessages(null)
     }
+
+    /** True while the SSE connection is currently open; used by the watchdog alarm to detect a silently-dead connection and force a reload. */
+    fun isConnected(): Boolean = connected
 
     fun reload() {
         stop()
@@ -103,6 +111,12 @@ class NtfyWatcher(
         })
     }
 
+    private fun lastEventId(): String? = AppConfig.prefs(ctx).getString(KEY_LAST_EVENT_ID, null)
+
+    private fun saveLastEventId(id: String) {
+        AppConfig.prefs(ctx).edit().putString(KEY_LAST_EVENT_ID, id).apply()
+    }
+
     private fun connect() {
         if (!running) return
         val topic = AppConfig.ntfyTopic(ctx)
@@ -110,19 +124,27 @@ class NtfyWatcher(
             handler.postDelayed({ connect() }, 5000)
             return
         }
-        val url = "https://ntfy.sh/${topic}/sse"
+        // Resume from the last message we actually processed instead of always "now": if the
+        // phone was asleep or the service got restarted, a START sent in the gap would
+        // otherwise be lost forever. Falling back to "2m" bounds the catch-up window on a
+        // completely fresh install (no saved id yet).
+        val since = lastEventId()?.takeIf { it.isNotBlank() } ?: "2m"
+        val url = "https://ntfy.sh/${topic}/sse?since=$since"
         Log.i(TAG, "Connecting SSE: $url")
         val req = Request.Builder().url(url).header("Accept", "text/event-stream").build()
         val factory = EventSources.createFactory(client)
         source = factory.newEventSource(req, object : EventSourceListener() {
             override fun onOpen(eventSource: EventSource, response: Response) {
                 Log.i(TAG, "SSE open")
+                connected = true
                 backoffMs = 1000L
             }
             override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
                 if (data.isBlank()) return
                 try {
                     val obj = JSONObject(data)
+                    val msgId = obj.optString("id", "")
+                    if (msgId.isNotBlank()) saveLastEventId(msgId)
                     val event = obj.optString("event", "message")
                     if (event != "message") return
                     val message = obj.optString("message", "")
@@ -136,8 +158,12 @@ class NtfyWatcher(
                     Log.w(TAG, "SSE parse error: ${e.message}")
                 }
             }
-            override fun onClosed(eventSource: EventSource) { scheduleReconnect("closed") }
+            override fun onClosed(eventSource: EventSource) {
+                connected = false
+                scheduleReconnect("closed")
+            }
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
+                connected = false
                 Log.w(TAG, "SSE failure: ${t?.message} code=${response?.code}")
                 scheduleReconnect("failure")
             }

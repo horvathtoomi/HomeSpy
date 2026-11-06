@@ -14,8 +14,12 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri ?: ""
         val method = session.method
-        return try {
+        val resp = try {
             when {
+                // The standalone remote_controller.html is opened from a different origin (a
+                // local file, or a different host entirely) than the phone's own IP:5000, so
+                // browsers preflight non-trivial cross-origin requests with OPTIONS first.
+                method == Method.OPTIONS -> newFixedLengthResponse(Response.Status.OK, "text/plain", "")
                 method == Method.GET && (uri == "/" || uri == "/index.html") ->
                     newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", DashboardHtml.CONTENT)
                 method == Method.POST && uri == "/api/control" -> handleControl(session)
@@ -23,6 +27,7 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
                 method == Method.GET && uri == "/api/snapshot.jpg" -> handleSnapshot(session)
                 method == Method.GET && uri == "/api/audio.wav" -> handleAudio(session)
                 method == Method.GET && uri == "/api/mjpeg" -> handleMjpeg(session)
+                method == Method.GET && uri == "/api/live_pack" -> handleLivePack(session)
                 method == Method.GET && uri == "/health" -> newFixedLengthResponse(Response.Status.OK, "application/json", """{"ok":true}""")
                 else -> json(Response.Status.NOT_FOUND, """{"ok":false,"error":"not found"}""")
             }
@@ -30,6 +35,10 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
             Log.e(TAG, "serve error", e)
             json(Response.Status.INTERNAL_ERROR, """{"ok":false,"error":"${e.message?.replace("\"", "'")}"}""")
         }
+        resp.addHeader("Access-Control-Allow-Origin", "*")
+        resp.addHeader("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        resp.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        return resp
     }
 
     private fun handleControl(session: IHTTPSession): Response {
@@ -109,6 +118,17 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
         resp.addHeader("Cache-Control", "no-store")
         resp.addHeader("Connection", "keep-alive")
         return resp
+    }
+
+    /** Single-request JSON pack (snapshot + recent audio, both base64) for NAT-relay polling. */
+    private fun handleLivePack(session: IHTTPSession): Response {
+        if (!isAuthorized(session)) {
+            MonitorBus.failedAuthCount++
+            return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
+        }
+        val streamer = MonitorService.instance?.webStreamer
+            ?: return json(Response.Status.SERVICE_UNAVAILABLE, """{"ok":false,"error":"service not running"}""")
+        return json(Response.Status.OK, streamer.livePackJson().toString())
     }
 
     private fun isAuthorized(session: IHTTPSession): Boolean {

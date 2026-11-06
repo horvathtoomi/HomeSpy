@@ -1,6 +1,7 @@
 package com.remotemonitor.app
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -19,6 +20,11 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 
 class MainActivity : AppCompatActivity() {
+    companion object {
+        /** Set on the launch Intent by MonitorService.wakeScreenAndShowActivity() when it needs to surface the UI over a locked/sleeping screen to get camera/mic access. */
+        const val EXTRA_STEALTH_WAKE = "stealth_wake"
+    }
+
     private lateinit var tvStatus: TextView
     private lateinit var tvDetails: TextView
     private lateinit var etToken: EditText
@@ -34,6 +40,12 @@ class MainActivity : AppCompatActivity() {
     // that session ends so the NEXT stream still auto-dims instead of staying stuck awake.
     private var wokeByTouch = false
     private var lastState: MonitorState = MonitorState.IDLE
+    // True only while this Activity instance is on-screen *because* MonitorService stealth-woke
+    // it for a remote request, not because the user actually opened the app. In that case the
+    // activity must get out of the way again once the stream ends, or its own
+    // FLAG_KEEP_SCREEN_ON would keep the screen lit forever and defeat the whole point of a
+    // "nothing visibly happened" remote wake.
+    private var stealthWakeActive = false
 
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -87,14 +99,40 @@ class MainActivity : AppCompatActivity() {
         MonitorBus.onStateChanged = { runOnUiThread { refreshUi() } }
         requestAllPerms()
         restartService()
+        MonitorService.scheduleWatchdogAlarm(this)
+        applyStealthWakeIfRequested(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        applyStealthWakeIfRequested(intent)
+    }
+
+    /**
+     * When launched by MonitorService to wake a sleeping/locked phone for a remote stream
+     * request, surface over the keyguard at near-zero brightness instead of the normal UI
+     * flash — the whole point is that a glance at the phone shouldn't reveal it's recording.
+     */
+    private fun applyStealthWakeIfRequested(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_STEALTH_WAKE, false) != true) return
+        setShowWhenLocked(true)
+        setTurnScreenOn(true)
+        val km = getSystemService(KeyguardManager::class.java)
+        km?.requestDismissKeyguard(this, null)
+        manualDim = true
+        stealthWakeActive = true
+        applyDim(true)
     }
 
     override fun onResume() {
         super.onResume()
+        MonitorBus.activityResumed = true
         handler.post(ticker)
         refreshUi()
     }
     override fun onPause() {
+        MonitorBus.activityResumed = false
         handler.removeCallbacks(ticker)
         super.onPause()
     }
@@ -140,6 +178,14 @@ class MainActivity : AppCompatActivity() {
         if (wokeByTouch && lastState == MonitorState.STREAMING && state != MonitorState.STREAMING) {
             manualDim = null
             wokeByTouch = false
+        }
+        // A stealth-woken activity must retreat once the stream it was woken for is actually
+        // over, so FLAG_KEEP_SCREEN_ON stops holding the screen on and the normal OS timeout
+        // can put it back to sleep — otherwise a remote START would leave the screen lit
+        // indefinitely after STOP.
+        if (stealthWakeActive && state == MonitorState.IDLE && lastState != MonitorState.IDLE) {
+            stealthWakeActive = false
+            moveTaskToBack(true)
         }
         lastState = state
 

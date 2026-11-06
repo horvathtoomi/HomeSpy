@@ -1,5 +1,6 @@
 package com.remotemonitor.app
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,12 +9,16 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.PixelFormat
 import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
 import com.pedro.common.ConnectChecker
 import com.pedro.encoder.input.video.CameraHelper
 import com.pedro.library.base.Camera2Base
@@ -35,12 +40,40 @@ class MonitorService : Service(), ConnectChecker {
     companion object {
         private const val TAG = "RemoteMonitor"
         private const val CHANNEL_ID = "monitor_channel"
+        private const val WAKE_CHANNEL_ID = "monitor_wake_channel"
         private const val NOTIF_ID = 1001
+        private const val NOTIF_WAKE_ID = 1002
+        private const val WATCHDOG_REQUEST_CODE = 997
+        private const val WATCHDOG_INTERVAL_MS = 60_000L
         const val ACTION_APPLY = "com.remotemonitor.app.APPLY"
         const val ACTION_RELOAD_CONFIG = "com.remotemonitor.app.RELOAD_CONFIG"
+        const val ACTION_RESTART_SELF = "com.remotemonitor.app.RESTART_SELF"
         const val EXTRA_PAYLOAD = "payload"
 
         @Volatile var instance: MonitorService? = null
+
+        /**
+         * Self-chaining 60s heartbeat: AlarmManager has no native "repeat exactly while idle"
+         * primitive (setRepeating isn't exact and drifts under Doze), so each firing of
+         * ACTION_RESTART_SELF reschedules the next one. Call this from MainActivity.onCreate,
+         * BOOT_COMPLETED, MonitorService.onCreate, and every ACTION_RESTART_SELF so the chain
+         * restarts itself from any of those entry points.
+         */
+        fun scheduleWatchdogAlarm(context: Context) {
+            try {
+                val intent = Intent(context, ControlReceiver::class.java).apply {
+                    action = ACTION_RESTART_SELF
+                }
+                val pi = PendingIntent.getBroadcast(
+                    context, WATCHDOG_REQUEST_CODE, intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + WATCHDOG_INTERVAL_MS, pi)
+            } catch (e: Exception) {
+                Log.e(TAG, "scheduleWatchdogAlarm failed: ${e.message}")
+            }
+        }
     }
 
     val webStreamer: DirectWebStreamer? get() = directWebStreamer
@@ -50,6 +83,9 @@ class MonitorService : Service(), ConnectChecker {
     private var watchdogJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var screenWakeLock: PowerManager.WakeLock? = null
+    private var overlayView: View? = null
+    private var overlayWindowManager: WindowManager? = null
 
     private var rtspServer: RtspServerCamera2? = null
     private var rtspClient: RtspCamera2? = null
@@ -74,6 +110,21 @@ class MonitorService : Service(), ConnectChecker {
         instance = this
         createChannel()
         startForeground(NOTIF_ID, buildNotification("Service starting"))
+
+        // Must be attached before any camera/mic access attempt: Android's CameraService and
+        // AudioPolicyService on API 30 refuse hardware access to a backgrounded process unless
+        // it owns a visible, attached TYPE_APPLICATION_OVERLAY window, even with
+        // SYSTEM_ALERT_WINDOW granted. A 1x1 transparent window satisfies that check invisibly.
+        ensureOverlayWindow()
+
+        // Held for the service's entire lifetime (including IDLE), not just while streaming,
+        // so a screen-off, app-closed phone still answers a remote START within <1s instead of
+        // the CPU/Wi-Fi going to sleep and missing the signal for hours.
+        acquireStandbyLocks()
+
+        // Keeps the self-restart chain alive from the service side too, independent of
+        // MainActivity ever having been opened — see scheduleWatchdogAlarm's doc.
+        scheduleWatchdogAlarm(this)
 
         try {
             apiServer = ControlApiServer(this, 5000)
@@ -111,8 +162,42 @@ class MonitorService : Service(), ConnectChecker {
         return START_STICKY
     }
 
+    /**
+     * Fires when the user swipes the app away from the recents list. Without this, Android
+     * treats task removal as a signal to tear the service down shortly after, even though it's
+     * a foreground service — so a remote-controlled phone that gets "closed" would silently stop
+     * answering. Schedule an exact alarm that restarts the service a moment later; by the time it
+     * fires the OS has finished its own teardown, so a plain re-entrant start here is unreliable.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        Log.w(TAG, "onTaskRemoved: app closed from recents, scheduling service restart")
+        try {
+            val restartIntent = Intent(this, ControlReceiver::class.java).apply {
+                action = ACTION_RESTART_SELF
+            }
+            val pi = PendingIntent.getBroadcast(
+                this, 998, restartIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 500, pi)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to schedule restart alarm", e)
+        }
+    }
+
     fun applyPayload(payload: ControlPayload) {
         scope.launch { applyPayloadSync(payload) }
+    }
+
+    /** Called by the watchdog alarm (ControlReceiver.ACTION_RESTART_SELF) when the service is already alive, to catch a silently-dead ntfy SSE connection that would otherwise never self-heal. */
+    fun checkNtfyHealth() {
+        val watcher = ntfyWatcher ?: return
+        if (!watcher.isConnected()) {
+            Log.w(TAG, "Watchdog: Ntfy SSE not connected, reloading")
+            watcher.reload()
+        }
     }
 
     suspend fun applyPayloadSync(payload: ControlPayload) {
@@ -217,10 +302,30 @@ class MonitorService : Service(), ConnectChecker {
         MonitorBus.endsAtMs = if (payload.durationSeconds > 0)
             MonitorBus.startedAtMs + payload.durationSeconds * 1000L else 0L
 
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!pm.isInteractive && payload.mode != "AUDIO_ONLY") {
+            // AUDIO_ONLY never touches the camera/preview, so there's nothing that needs a
+            // foregrounded activity to unblock — waking the screen for it would just be a
+            // pointless, visible flash with no benefit.
+            Log.i(TAG, "Screen is off; waking it before touching camera/mic")
+            wakeScreenAndShowActivity(payload.durationSeconds)
+            // Wait for MainActivity to actually reach onResume() (not just for
+            // startActivity() to have been called) before opening the camera — a fixed 300ms
+            // isn't reliably enough on a cold wake from deep sleep on this hardware, but
+            // waiting indefinitely risks wedging a START forever if the activity never comes
+            // up for some reason, so cap it.
+            withTimeoutOrNull(2500) {
+                while (!MonitorBus.activityResumed) delay(100)
+            }
+            // Small additional settle time even after onResume() fires, before touching the
+            // camera — same reasoning as the old fixed delay, just on top of the dynamic wait
+            // rather than in place of it.
+            delay(200)
+        }
+
         try {
             val ok = startStreaming(payload)
             if (ok) {
-                acquireStreamingLocks()
                 MonitorBus.update(MonitorState.STREAMING)
                 if (payload.mode != "AUDIO_ONLY" && payload.torch && payload.camera != "FRONT") {
                     try {
@@ -241,14 +346,12 @@ class MonitorService : Service(), ConnectChecker {
             } else {
                 MonitorBus.lastError = "Failed to prepare/start stream"
                 cleanupStreamers()
-                releaseStreamingLocks()
                 MonitorBus.update(MonitorState.IDLE)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Start failed", e)
             MonitorBus.lastError = "Start failed: ${e.message}"
             cleanupStreamers()
-            releaseStreamingLocks()
             MonitorBus.update(MonitorState.IDLE)
         }
     }
@@ -264,7 +367,8 @@ class MonitorService : Service(), ConnectChecker {
         } catch (_: Exception) {}
         MonitorBus.torchActive = false
         cleanupStreamers()
-        releaseStreamingLocks()
+        releaseScreenWakeLock()
+        getSystemService(NotificationManager::class.java).cancel(NOTIF_WAKE_ID)
         MonitorBus.activePayload = null
         MonitorBus.streamUrl = ""
         MonitorBus.startedAtMs = 0L
@@ -298,8 +402,24 @@ class MonitorService : Service(), ConnectChecker {
         val isAudioOnly = payload.mode == "AUDIO_ONLY"
         val isVideoOnly = payload.mode == "VIDEO_ONLY"
         val isBack = payload.camera != "FRONT"
-        val target = payload.streamTarget.trim()
-        val useServer = target.isEmpty()
+        val rawTarget = payload.streamTarget.trim()
+        // Empty target, or an explicit "DIRECT", both mean: no external RTSP/RTMP push wanted,
+        // just the built-in local RTSP server (if anyone cares to connect to it) plus the
+        // phone's own HTTP endpoints. In that case the mic must stay exclusively with
+        // DirectWebStreamer's AudioRecord (see below) rather than RootEncoder.
+        val isDirect = rawTarget.isEmpty() || rawTarget.equals("DIRECT", ignoreCase = true)
+        val target = if (isDirect) "" else rawTarget
+        val useServer = isDirect
+
+        if (isDirect && isAudioOnly) {
+            // Direct + AUDIO_ONLY needs no RootEncoder instance at all: there is no video to
+            // serve over the built-in RTSP server, so spinning one up (and opening the camera
+            // preview that goes with it) only burns CPU and needlessly wakes the screen.
+            // DirectWebStreamer's own AudioRecord (started right after this returns) is the
+            // only thing that actually needs to run.
+            MonitorBus.streamUrl = ""
+            return true
+        }
 
         val (w, h) = resolveVideoResolution(payload.videoResolution)
 
@@ -312,22 +432,23 @@ class MonitorService : Service(), ConnectChecker {
             val token = AppConfig.token(this)
             server.getStreamClient().setAuthorization("admin", token)
 
-            var audioOk = true
-            if (!isVideoOnly) {
-                audioOk = server.prepareAudio(64 * 1024, 32000, true, false, false)
-            }
+            // Deliberately never call server.prepareAudio() here: this RootEncoder instance is
+            // only a secondary local RTSP viewer for this mode, and the mic must be free for
+            // DirectWebStreamer's own AudioRecord (started by MonitorService right after this
+            // function returns) to open without contention. The RTSP server therefore only ever
+            // carries video.
             // RootEncoder's startStream()/startEncoders() unconditionally starts the video
-            // encoder regardless of mode; setOnlyAudio() only suppresses it on the wire, not
+            // encoder regardless of mode; setOnlyVideo() only suppresses audio on the wire, not
             // at prepare/start time. Leaving it unprepared in AUDIO_ONLY mode throws
             // "VideoEncoder not prepared yet" from startStream() below, so it must always be
             // prepared (the camera itself still stays untouched since startPreview() below
             // remains gated on !isAudioOnly).
             val videoOk = server.prepareVideo(w, h, fps, bitrateBps, 0, 90)
 
-            if (!audioOk || !videoOk) return false
+            if (!videoOk) return false
 
-            server.getStreamClient().setOnlyAudio(isAudioOnly)
-            server.getStreamClient().setOnlyVideo(isVideoOnly)
+            server.getStreamClient().setOnlyAudio(false)
+            server.getStreamClient().setOnlyVideo(true)
 
             if (!isAudioOnly) {
                 try {
@@ -482,30 +603,31 @@ class MonitorService : Service(), ConnectChecker {
         }.filter { it.isNotBlank() }
     } catch (_: Exception) { emptyList() }
 
-    private fun acquireStreamingLocks() {
+    private fun acquireStandbyLocks() {
         try {
             if (wakeLock == null) {
                 val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "remotemonitor:streaming_wakelock").apply {
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "remotemonitor:standby_wakelock").apply {
                     setReferenceCounted(false)
                 }
             }
-            if (wakeLock?.isHeld == false) wakeLock?.acquire(10 * 3600 * 1000L)
+            if (wakeLock?.isHeld == false) wakeLock?.acquire()
 
             if (wifiLock == null) {
                 val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
                 @Suppress("DEPRECATION")
-                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "remotemonitor:streaming_wifilock").apply {
+                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "remotemonitor:standby_wifilock").apply {
                     setReferenceCounted(false)
                 }
             }
             if (wifiLock?.isHeld == false) wifiLock?.acquire()
+            Log.i(TAG, "Standby wake/wifi locks acquired for service lifetime")
         } catch (e: Exception) {
-            Log.w(TAG, "acquireStreamingLocks error: ${e.message}")
+            Log.w(TAG, "acquireStandbyLocks error: ${e.message}")
         }
     }
 
-    private fun releaseStreamingLocks() {
+    private fun releaseStandbyLocks() {
         try {
             if (wakeLock?.isHeld == true) wakeLock?.release()
         } catch (_: Exception) {}
@@ -514,11 +636,118 @@ class MonitorService : Service(), ConnectChecker {
         } catch (_: Exception) {}
     }
 
+    private fun ensureOverlayWindow() {
+        if (overlayView != null) return
+        if (!Settings.canDrawOverlays(this)) {
+            Log.w(TAG, "SYSTEM_ALERT_WINDOW not granted; camera/mic may fail while backgrounded with screen off")
+            return
+        }
+        try {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val view = View(this)
+            val params = WindowManager.LayoutParams(
+                1, 1,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = 0
+                y = 0
+            }
+            wm.addView(view, params)
+            overlayView = view
+            overlayWindowManager = wm
+            Log.i(TAG, "Attached invisible 1x1 overlay window")
+        } catch (e: Exception) {
+            Log.w(TAG, "ensureOverlayWindow failed: ${e.message}")
+        }
+    }
+
+    private fun removeOverlayWindow() {
+        try {
+            overlayView?.let { overlayWindowManager?.removeView(it) }
+        } catch (_: Exception) {}
+        overlayView = null
+        overlayWindowManager = null
+    }
+
     private fun createChannel() {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Monitor Service", NotificationManager.IMPORTANCE_LOW)
         )
+        // Separate, high-importance channel: the main channel is IMPORTANCE_LOW (silent,
+        // ongoing status notification) which cannot carry a heads-up/full-screen notification
+        // on Android — needed to reliably bring the activity up over a locked keyguard.
+        nm.createNotificationChannel(
+            NotificationChannel(WAKE_CHANNEL_ID, "Monitor Wake", NotificationManager.IMPORTANCE_HIGH)
+        )
+    }
+
+    /**
+     * Wakes a sleeping/locked screen and brings MainActivity to the front in "stealth" mode
+     * (minimum brightness, see MainActivity.EXTRA_STEALTH_WAKE) so Android's CameraService /
+     * AudioPolicyService treat this as a foregrounded request instead of blocking it. Acquires
+     * a SCREEN_DIM_WAKE_LOCK with ACQUIRE_CAUSES_WAKEUP, released again in releaseScreenWakeLock()
+     * once the stream stops.
+     */
+    private fun wakeScreenAndShowActivity(durationSeconds: Long) {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (screenWakeLock == null) {
+                @Suppress("DEPRECATION")
+                screenWakeLock = pm.newWakeLock(
+                    PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                    "remotemonitor:screen_wakelock"
+                )
+            }
+            // Safety-net timeout in case a STOP/duration-expiry somehow never arrives to release
+            // it explicitly — sized to the actual requested session length (plus a 30s margin)
+            // instead of a flat 10 minutes, so a long-running continuous watch session doesn't
+            // have the screen wake lock quietly expire out from under it mid-stream.
+            val timeoutMs = if (durationSeconds > 0) (durationSeconds + 30) * 1000L else 4 * 3600 * 1000L
+            if (screenWakeLock?.isHeld == false) screenWakeLock?.acquire(timeoutMs)
+
+            val activityIntent = Intent(this, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                putExtra(MainActivity.EXTRA_STEALTH_WAKE, true)
+            }
+            try {
+                startActivity(activityIntent)
+            } catch (e: Exception) {
+                Log.w(TAG, "Direct startActivity failed, relying on full-screen-intent notification: ${e.message}")
+            }
+            showWakeNotification(activityIntent)
+        } catch (e: Exception) {
+            Log.w(TAG, "wakeScreenAndShowActivity failed: ${e.message}")
+        }
+    }
+
+    private fun releaseScreenWakeLock() {
+        try {
+            if (screenWakeLock?.isHeld == true) screenWakeLock?.release()
+        } catch (_: Exception) {}
+    }
+
+    private fun showWakeNotification(activityIntent: Intent) {
+        val pi = PendingIntent.getActivity(
+            this, 2, activityIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notif = Notification.Builder(this, WAKE_CHANNEL_ID)
+            .setContentTitle("RemoteMonitor")
+            .setContentText("Waking for remote stream")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setFullScreenIntent(pi, true)
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .build()
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.notify(NOTIF_WAKE_ID, notif)
     }
 
     private fun buildNotification(text: String): Notification {
@@ -543,7 +772,9 @@ class MonitorService : Service(), ConnectChecker {
     override fun onDestroy() {
         watchdogJob?.cancel()
         cleanupStreamers()
-        releaseStreamingLocks()
+        releaseStandbyLocks()
+        releaseScreenWakeLock()
+        removeOverlayWindow()
         MonitorBus.activePayload = null
         MonitorBus.streamUrl = ""
         MonitorBus.startedAtMs = 0L

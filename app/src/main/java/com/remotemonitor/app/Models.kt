@@ -18,7 +18,23 @@ object AppConfig {
     fun token(ctx: Context): String =
         prefs(ctx).getString(KEY_TOKEN, DEFAULT_TOKEN)?.ifBlank { DEFAULT_TOKEN } ?: DEFAULT_TOKEN
 
-    fun ntfyTopic(ctx: Context): String = prefs(ctx).getString(KEY_NTFY, "") ?: ""
+    /**
+     * Returns the configured ntfy topic, or generates and persists a deterministic per-device
+     * default (derived from ANDROID_ID) the first time it's read blank. Remote control must
+     * work immediately after install without the user having to open the app and type a topic
+     * in first — a device sitting headless behind NAT has no other way to receive a start signal.
+     */
+    fun ntfyTopic(ctx: Context): String {
+        val stored = prefs(ctx).getString(KEY_NTFY, null)
+        if (!stored.isNullOrBlank()) return stored
+        val androidId = try {
+            android.provider.Settings.Secure.getString(ctx.contentResolver, android.provider.Settings.Secure.ANDROID_ID)
+        } catch (_: Exception) { null }
+        val suffix = androidId?.takeLast(6)?.ifBlank { null } ?: "a40home"
+        val generated = "rm-a40-$suffix"
+        prefs(ctx).edit().putString(KEY_NTFY, generated).apply()
+        return generated
+    }
     fun mqttUrl(ctx: Context): String = prefs(ctx).getString(KEY_MQTT, "") ?: ""
 
     fun save(ctx: Context, token: String, ntfy: String, mqtt: String) {
@@ -113,6 +129,10 @@ object MonitorBus {
     @Volatile var streamUrl: String = ""
     @Volatile var failedAuthCount: Int = 0
     @Volatile var torchActive: Boolean = false
+    // Tracks MainActivity's actual onResume()/onPause() lifecycle, so a service-triggered
+    // stealth wake can wait for the activity to genuinely be in the foreground (not just
+    // "startActivity() was called") before opening the camera on a cold wake from deep sleep.
+    @Volatile var activityResumed: Boolean = false
     var onStateChanged: ((MonitorState) -> Unit)? = null
 
     fun snapshot(): JSONObject = JSONObject().apply {

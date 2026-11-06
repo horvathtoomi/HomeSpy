@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RemoteMonitor — Remote Controller</title>
+<style>
+  :root {
+    --bg: #090a0f;
+    --surface: #11141d;
+    --surface-elevated: #161a26;
+    --border: #1f2536;
+    --border-subtle: #171c2b;
+    --border-focus: #3b82f6;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --live: #10b981;
+    --live-bg: rgba(16, 185, 129, 0.08);
+    --live-border: rgba(16, 185, 129, 0.25);
+    --danger: #ef4444;
+    --danger-bg: rgba(239, 68, 68, 0.08);
+    --danger-border: rgba(239, 68, 68, 0.25);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+  body { background: var(--bg); color: var(--text-primary); min-height: 100vh; padding: 24px 16px; -webkit-font-smoothing: antialiased; }
+  .app-shell { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; gap: 10px; }
+  .brand-title { font-size: 1.1rem; font-weight: 600; letter-spacing: -0.01em; }
+  .brand-sub { font-size: 0.74rem; color: var(--text-muted); margin-top: 2px; }
+  .status-badge { display: inline-flex; align-items: center; gap: 8px; padding: 4px 12px; border-radius: 6px; font-size: 0.74rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; background: var(--surface); border: 1px solid var(--border); color: var(--text-muted); }
+  .status-badge.streaming { background: var(--live-bg); border-color: var(--live-border); color: var(--live); }
+  .status-badge.starting { background: rgba(245, 158, 11, 0.08); border-color: rgba(245, 158, 11, 0.25); color: #fbbf24; }
+  .status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .status-badge.streaming .status-dot { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
+  .card-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .card-label { font-size: 0.74rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-secondary); }
+  .tabs { display: flex; gap: 6px; }
+  .tab-btn { font-size: 0.78rem; font-weight: 600; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-elevated); color: var(--text-secondary); cursor: pointer; }
+  .tab-btn.active { background: #f8fafc; color: #090a0f; border-color: #f8fafc; }
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+  .form-item { display: flex; flex-direction: column; gap: 5px; }
+  .form-label { font-size: 0.74rem; font-weight: 500; color: var(--text-secondary); }
+  input[type="text"], input[type="password"], input[type="number"], select {
+    background: var(--surface-elevated); border: 1px solid var(--border); color: var(--text-primary);
+    font-size: 0.84rem; padding: 8px 12px; border-radius: 6px; outline: none; transition: border-color 0.15s ease; width: 100%;
+  }
+  input:focus, select:focus { border-color: var(--border-focus); }
+  .telemetry-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .metric-cell { background: var(--surface-elevated); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; }
+  .metric-label { font-size: 0.68rem; font-weight: 500; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .metric-value { font-size: 1.05rem; font-weight: 600; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+  .action-deck { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 4px; }
+  button { font-size: 0.82rem; font-weight: 500; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-elevated); color: var(--text-primary); cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: background 0.12s ease, border-color 0.12s ease; user-select: none; }
+  button:hover { background: #1e2436; border-color: #2b334a; }
+  button:active { transform: translateY(1px); }
+  .btn-start { background: #f8fafc; color: #090a0f; border-color: #f8fafc; font-weight: 600; }
+  .btn-start:hover { background: #e2e8f0; border-color: #e2e8f0; }
+  .btn-stop { background: var(--danger-bg); border-color: var(--danger-border); color: #fca5a5; }
+  .btn-stop:hover { background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.35); }
+  .btn-active { border-color: #3b82f6; color: #93c5fd; background: rgba(59, 130, 246, 0.12); }
+  .hint { font-size: 0.72rem; color: var(--text-muted); line-height: 1.5; }
+  .console-box { background: #05070a; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 0.74rem; color: var(--text-secondary); max-height: 160px; overflow-y: auto; white-space: pre-wrap; line-height: 1.45; }
+  .hidden { display: none !important; }
+  .snapshot-box { background: #000; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; min-height: 160px; }
+  .snapshot-box img { width: 100%; display: block; max-height: 480px; object-fit: contain; background: #000; }
+</style>
+</head>
+<body>
+<div class="app-shell">
+  <header>
+    <div>
+      <div class="brand-title">RemoteMonitor — Remote Controller</div>
+      <div class="brand-sub">Standalone controller · open from any PC or phone browser</div>
+    </div>
+    <div id="statusBadge" class="status-badge">
+      <span class="status-dot"></span>
+      <span id="badgeText">DISCONNECTED</span>
+    </div>
+  </header>
+
+  <div class="card">
+    <div class="card-header">
+      <span class="card-label">Connection</span>
+      <div class="tabs">
+        <button class="tab-btn active" id="tabDirect" onclick="switchMode('direct')">Direct IP / Tailscale</button>
+        <button class="tab-btn" id="tabNtfy" onclick="switchMode('ntfy')">Ntfy.sh Relay (no IP needed)</button>
+      </div>
+    </div>
+
+    <div id="directFields" class="form-grid">
+      <div class="form-item">
+        <label class="form-label" for="baseUrl">Phone base URL</label>
+        <input type="text" id="baseUrl" placeholder="http://192.168.1.50:5000 or http://100.x.x.x:5000">
+      </div>
+      <div class="form-item">
+        <label class="form-label" for="tokenInput">Auth Token</label>
+        <input type="password" id="tokenInput" placeholder="changeme-secret-token" autocomplete="off">
+      </div>
+    </div>
+
+    <div id="ntfyFields" class="form-grid hidden">
+      <div class="form-item">
+        <label class="form-label" for="ntfyTopic">Ntfy topic</label>
+        <input type="text" id="ntfyTopic" placeholder="rm-a40-xxxxxx">
+      </div>
+      <div class="form-item">
+        <label class="form-label" for="tokenInputNtfy">Auth Token (sent inside each command's JSON)</label>
+        <input type="password" id="tokenInputNtfy" placeholder="changeme-secret-token" autocomplete="off">
+      </div>
+    </div>
+    <div class="hint" id="modeHint">Direct mode talks straight to the phone's built-in HTTP server: live snapshot + continuous audio, lowest latency. Requires the phone to be reachable on your LAN, via Tailscale, or via a port-forward.</div>
+
+    <div class="action-deck">
+      <button class="btn-start" onclick="connect()">Connect</button>
+      <button onclick="disconnect()">Disconnect</button>
+    </div>
+  </div>
+
+  <!-- Telemetry -->
+  <div class="card">
+    <div class="card-header"><span class="card-label">Device Telemetry</span></div>
+    <div class="telemetry-grid">
+      <div class="metric-cell"><span class="metric-label">Status</span><span class="metric-value" id="statState">--</span></div>
+      <div class="metric-cell"><span class="metric-label">Battery</span><span class="metric-value" id="statBattery">--</span></div>
+      <div class="metric-cell"><span class="metric-label">Remaining</span><span class="metric-value" id="statRemaining">--</span></div>
+      <div class="metric-cell"><span class="metric-label">Active Sensor</span><span class="metric-value" id="statCamera">--</span></div>
+      <div class="metric-cell"><span class="metric-label">Torch</span><span class="metric-value" id="statTorch">OFF</span></div>
+      <div class="metric-cell"><span class="metric-label">Last Update</span><span class="metric-value" id="statUpdated" style="font-size:0.82rem;">--</span></div>
+    </div>
+  </div>
+
+  <!-- Live view -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-label">Live View</span>
+      <span id="snapshotMeta" style="font-size:0.7rem; color:var(--text-muted);">--</span>
+    </div>
+    <div class="snapshot-box"><img id="liveSnapshot" alt="live snapshot"></div>
+    <audio id="liveAudio" controls style="width:100%;"></audio>
+    <div class="hint" id="audioHint"></div>
+  </div>
+
+  <!-- Controls -->
+  <div class="card">
+    <div class="card-header"><span class="card-label">Configuration & Control</span></div>
+    <div class="form-grid">
+      <div class="form-item">
+        <label class="form-label" for="selMode">Capture Mode</label>
+        <select id="selMode">
+          <option value="BOTH" selected>Video + Audio</option>
+          <option value="VIDEO_ONLY">Video Only</option>
+          <option value="AUDIO_ONLY">Audio Only</option>
+        </select>
+      </div>
+      <div class="form-item">
+        <label class="form-label" for="selCamera">Sensor</label>
+        <select id="selCamera">
+          <option value="BACK" selected>Rear Camera</option>
+          <option value="FRONT">Front Camera</option>
+        </select>
+      </div>
+      <div class="form-item">
+        <label class="form-label" for="selRes">Resolution</label>
+        <select id="selRes">
+          <option value="720p" selected>720p HD</option>
+          <option value="1080p">1080p FHD</option>
+          <option value="480p">480p SD</option>
+        </select>
+      </div>
+      <div class="form-item">
+        <label class="form-label" for="numBitrate">Bitrate (Kbps)</label>
+        <input type="number" id="numBitrate" value="1500" min="200" max="8000" step="100">
+      </div>
+      <div class="form-item">
+        <label class="form-label" for="numFps">Frame Rate (FPS)</label>
+        <input type="number" id="numFps" value="30" min="10" max="60" step="5">
+      </div>
+      <div class="form-item">
+        <label class="form-label" for="numDuration">Duration (s, 0 = continuous)</label>
+        <input type="number" id="numDuration" value="0" min="0" step="10">
+      </div>
+      <div class="form-item" style="grid-column: 1 / -1;">
+        <label class="form-label" for="txtTarget">Stream Target (leave empty / "DIRECT" for built-in server + web audio)</label>
+        <input type="text" id="txtTarget" placeholder="DIRECT (default), or rtsp://... / rtmp://...">
+      </div>
+    </div>
+    <div class="action-deck">
+      <button class="btn-start" onclick="sendAction('START')">Start Stream</button>
+      <button class="btn-stop" onclick="sendAction('STOP')">Stop Stream</button>
+      <button onclick="sendAction('SWITCH_CAMERA')">Switch Camera</button>
+      <button id="torchBtn" onclick="toggleTorch()"><span id="torchBtnText">Torch ON</span></button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header"><span class="card-label">Activity Log</span></div>
+    <div id="consoleLog" class="console-box">[00:00:00] Controller ready. Choose a connection mode and Connect.</div>
+  </div>
+</div>
+
+<script>
+let mode = 'direct';
+let lastTorchActive = false;
+let pollTimer = null;
+let snapshotTimer = null;
+let eventSource = null;
+
+const els = {
+  baseUrl: document.getElementById('baseUrl'),
+  token: document.getElementById('tokenInput'),
+  ntfyTopic: document.getElementById('ntfyTopic'),
+  tokenNtfy: document.getElementById('tokenInputNtfy'),
+};
+
+// Persist connection fields locally so reopening this file doesn't require retyping.
+['baseUrl', 'tokenInput', 'ntfyTopic', 'tokenInputNtfy'].forEach(id => {
+  const el = document.getElementById(id);
+  const saved = localStorage.getItem('rm_rc_' + id);
+  if (saved) el.value = saved;
+  el.addEventListener('input', () => localStorage.setItem('rm_rc_' + id, el.value));
+});
+
+function logMsg(msg, type = 'info') {
+  const el = document.getElementById('consoleLog');
+  const ts = new Date().toTimeString().split(' ')[0];
+  const prefix = type === 'err' ? '[ERR]' : (type === 'ok' ? '[OK]' : '[INFO]');
+  const line = `[${ts}] ${prefix} ${msg}\n`;
+  el.innerText = line + el.innerText.split('\n').slice(0, 20).join('\n');
+}
+
+function switchMode(m) {
+  mode = m;
+  document.getElementById('tabDirect').classList.toggle('active', m === 'direct');
+  document.getElementById('tabNtfy').classList.toggle('active', m === 'ntfy');
+  document.getElementById('directFields').classList.toggle('hidden', m !== 'direct');
+  document.getElementById('ntfyFields').classList.toggle('hidden', m !== 'ntfy');
+  document.getElementById('modeHint').innerText = m === 'direct'
+    ? 'Direct mode talks straight to the phone\'s built-in HTTP server: live snapshot + continuous audio, lowest latency. Requires the phone to be reachable on your LAN, via Tailscale, or via a port-forward.'
+    : 'Ntfy relay mode needs no IP address and works from anywhere, even mobile data: commands and status/snapshot pushes travel through the public ntfy.sh broker. No continuous audio over this path — only periodic image pushes (enable "Push Snapshots" on the phone/dashboard for this topic).';
+}
+
+function currentToken() {
+  return mode === 'direct' ? els.token.value.trim() : els.tokenNtfy.value.trim();
+}
+
+function setBadge(state) {
+  const badge = document.getElementById('statusBadge');
+  const text = document.getElementById('badgeText');
+  text.innerText = state;
+  badge.className = 'status-badge ' + (state === 'STREAMING' ? 'streaming' : (state === 'STARTING' ? 'starting' : ''));
+}
+
+function connect() {
+  if (mode === 'direct') connectDirect(); else connectNtfy();
+}
+
+function disconnect() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  const audio = document.getElementById('liveAudio');
+  audio.pause(); audio.removeAttribute('src'); audio.load();
+  ntfyAudioQueue = [];
+  ntfyAudioPlaying = false;
+  setBadge('DISCONNECTED');
+  logMsg('Disconnected', 'info');
+}
+
+// ---- Direct mode ----
+
+function connectDirect() {
+  const base = els.baseUrl.value.trim().replace(/\/$/, '');
+  if (!base) { logMsg('Enter the phone\'s base URL first', 'err'); return; }
+  disconnect();
+  logMsg('Connecting directly to ' + base, 'info');
+  document.getElementById('audioHint').innerText = '';
+  const audio = document.getElementById('liveAudio');
+  audio.src = base + '/api/audio.wav?auth_token=' + encodeURIComponent(currentToken()) + '&t=' + Date.now();
+  audio.play().catch(() => {});
+  pollStatusDirect();
+  pollTimer = setInterval(pollStatusDirect, 2000);
+  loadSnapshotDirect();
+}
+
+async function pollStatusDirect() {
+  const base = els.baseUrl.value.trim().replace(/\/$/, '');
+  const token = currentToken();
+  try {
+    const res = await fetch(base + '/api/status', { headers: { 'Authorization': 'Bearer ' + token } });
+    if (res.status === 401) { setBadge('UNAUTHORIZED'); logMsg('Invalid token', 'err'); return; }
+    if (!res.ok) { logMsg('Status HTTP ' + res.status, 'err'); return; }
+    const data = await res.json();
+    applyStatus(data);
+  } catch (e) {
+    setBadge('UNREACHABLE');
+  }
+}
+
+function loadSnapshotDirect() {
+  const base = els.baseUrl.value.trim().replace(/\/$/, '');
+  const token = currentToken();
+  if (!base || !token) return;
+  const img = new Image();
+  img.onload = () => {
+    document.getElementById('liveSnapshot').src = img.src;
+    document.getElementById('snapshotMeta').innerText = 'Updated ' + new Date().toLocaleTimeString();
+    if (mode === 'direct') snapshotTimer = setTimeout(loadSnapshotDirect, 1000);
+  };
+  img.onerror = () => { if (mode === 'direct') snapshotTimer = setTimeout(loadSnapshotDirect, 1000); };
+  img.src = base + '/api/snapshot.jpg?auth_token=' + encodeURIComponent(token) + '&t=' + Date.now();
+}
+
+// ---- Ntfy relay mode ----
+
+function connectNtfy() {
+  const topic = els.ntfyTopic.value.trim();
+  if (!topic) { logMsg('Enter the ntfy topic first', 'err'); return; }
+  disconnect();
+  document.getElementById('audioHint').innerText = 'Audio arrives as short clips pushed every ~2-5s over the ntfy relay — not truly continuous.';
+  const url = `https://ntfy.sh/${topic}-status/sse`;
+  logMsg('Subscribing to ' + url, 'info');
+  eventSource = new EventSource(url);
+  eventSource.onopen = () => logMsg('Ntfy SSE connected', 'ok');
+  eventSource.onerror = () => setBadge('UNREACHABLE');
+  eventSource.onmessage = (e) => {
+    if (!e.data) return;
+    try {
+      const obj = JSON.parse(e.data);
+      const event = obj.event || 'message';
+      if (event !== 'message') return;
+      // A pushed live_pack/status JSON lands in `message` as raw JSON text; a pushed
+      // snapshot or audio clip (PUT with raw bytes) lands as an `attachment` instead, with
+      // little/no message text.
+      const msg = (obj.message || '').trim();
+      if (msg.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(msg);
+          applyStatus(parsed);
+          if (parsed.jpeg_b64) {
+            document.getElementById('liveSnapshot').src = 'data:image/jpeg;base64,' + parsed.jpeg_b64;
+            document.getElementById('snapshotMeta').innerText = 'Live pack @ ' + new Date().toLocaleTimeString();
+          }
+          if (parsed.audio_wav_b64) {
+            enqueueAudio('data:audio/wav;base64,' + parsed.audio_wav_b64);
+          }
+        } catch (_) {}
+      }
+      if (obj.attachment && obj.attachment.url) {
+        const name = (obj.attachment.name || '').toLowerCase();
+        const type = (obj.attachment.type || '').toLowerCase();
+        if (name.endsWith('.wav') || type.startsWith('audio/')) {
+          enqueueAudio(obj.attachment.url);
+        } else {
+          document.getElementById('liveSnapshot').src = obj.attachment.url;
+          document.getElementById('snapshotMeta').innerText = 'Pushed snapshot @ ' + new Date().toLocaleTimeString();
+        }
+      }
+    } catch (err) {
+      logMsg('SSE parse error: ' + err.message, 'err');
+    }
+  };
+}
+
+// ---- Sequential playback queue for ntfy-relay audio clips (base64 WAV or attachment URL) ----
+let ntfyAudioQueue = [];
+let ntfyAudioPlaying = false;
+
+function enqueueAudio(src) {
+  if (ntfyAudioQueue.length > 5) ntfyAudioQueue.shift();
+  ntfyAudioQueue.push(src);
+  playNextNtfyAudio();
+}
+
+function playNextNtfyAudio() {
+  if (ntfyAudioPlaying || ntfyAudioQueue.length === 0) return;
+  ntfyAudioPlaying = true;
+  const src = ntfyAudioQueue.shift();
+  const a = new Audio(src);
+  a.onended = a.onerror = () => { ntfyAudioPlaying = false; playNextNtfyAudio(); };
+  a.play().catch(() => { ntfyAudioPlaying = false; playNextNtfyAudio(); });
+}
+
+async function sendNtfyCommand(payload) {
+  const topic = els.ntfyTopic.value.trim();
+  if (!topic) { logMsg('Enter the ntfy topic first', 'err'); return false; }
+  try {
+    await fetch(`https://ntfy.sh/${topic}`, { method: 'POST', body: JSON.stringify(payload) });
+    return true;
+  } catch (e) {
+    logMsg('Ntfy publish failed: ' + e.message, 'err');
+    return false;
+  }
+}
+
+// ---- Shared status rendering ----
+
+function applyStatus(d) {
+  const state = d.state || 'IDLE';
+  setBadge(state);
+  document.getElementById('statState').innerText = state;
+  document.getElementById('statBattery').innerText = (d.battery_percent ?? '--') + '%' + (d.charging ? ' (AC)' : '');
+  const remSec = d.remaining_seconds ?? 0;
+  document.getElementById('statRemaining').innerText = remSec > 0 ? (remSec + 's') : (state === 'STREAMING' ? 'Continuous' : '--');
+  const cam = d.camera || d.active_camera || '--';
+  document.getElementById('statCamera').innerText = cam === 'FRONT' ? 'Front' : (cam === 'BACK' ? 'Rear' : cam);
+  lastTorchActive = !!d.torch_active;
+  document.getElementById('statTorch').innerText = lastTorchActive ? 'ON' : 'OFF';
+  document.getElementById('statUpdated').innerText = new Date().toLocaleTimeString();
+  const torchBtn = document.getElementById('torchBtn');
+  const torchBtnText = document.getElementById('torchBtnText');
+  if (lastTorchActive) { torchBtn.classList.add('btn-active'); torchBtnText.innerText = 'Torch OFF'; }
+  else { torchBtn.classList.remove('btn-active'); torchBtnText.innerText = 'Torch ON'; }
+}
+
+function toggleTorch() {
+  sendAction(lastTorchActive ? 'TORCH_OFF' : 'TORCH_ON');
+}
+
+function buildPayload(action) {
+  return {
+    auth_token: currentToken(),
+    action: action,
+    mode: document.getElementById('selMode').value,
+    camera: document.getElementById('selCamera').value,
+    video_Resolution: document.getElementById('selRes').value,
+    video_bitrate_kbps: parseInt(document.getElementById('numBitrate').value, 10) || 1500,
+    fps: parseInt(document.getElementById('numFps').value, 10) || 30,
+    duration_seconds: parseInt(document.getElementById('numDuration').value, 10) || 0,
+    stream_target: document.getElementById('txtTarget').value.trim(),
+    ntfy_push_snapshots: mode === 'ntfy'
+  };
+}
+
+async function sendAction(action) {
+  const token = currentToken();
+  if (!token) { logMsg('Token field is empty', 'err'); return; }
+  const payload = buildPayload(action);
+  logMsg('Dispatching ' + action + ' via ' + mode + '...', 'info');
+
+  if (mode === 'ntfy') {
+    const ok = await sendNtfyCommand(payload);
+    if (ok) logMsg(action + ' published to ntfy topic', 'ok');
+    return;
+  }
+
+  const base = els.baseUrl.value.trim().replace(/\/$/, '');
+  if (!base) { logMsg('Enter the phone\'s base URL first', 'err'); return; }
+  try {
+    const res = await fetch(base + '/api/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (res.ok && data.ok) {
+      logMsg('Action ' + action + ' acknowledged (state: ' + data.state + ')', 'ok');
+    } else {
+      logMsg('Action ' + action + ' declined: ' + (data.error || 'server error'), 'err');
+    }
+    pollStatusDirect();
+  } catch (e) {
+    logMsg('Network failure: ' + e.message, 'err');
+  }
+}
+</script>
+</body>
+</html>
