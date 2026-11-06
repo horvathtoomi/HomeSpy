@@ -81,6 +81,28 @@ class NtfyWatcher(
         })
     }
 
+    /** Uploads a JPEG snapshot as an ntfy attachment to https://ntfy.sh/${topic}-status (PUT with raw bytes). */
+    fun publishSnapshot(jpeg: ByteArray) {
+        val topic = AppConfig.ntfyTopic(ctx).trim()
+        if (topic.isBlank()) return
+        val url = "https://ntfy.sh/${topic}-status"
+        val body = jpeg.toRequestBody("image/jpeg".toMediaType())
+        val req = Request.Builder()
+            .url(url)
+            .put(body)
+            .header("Filename", "snapshot.jpg")
+            .header("Title", "Snapshot")
+            .build()
+        client.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.w(TAG, "Snapshot publish failed: ${e.message}")
+            }
+            override fun onResponse(call: Call, response: Response) {
+                response.close()
+            }
+        })
+    }
+
     private fun connect() {
         if (!running) return
         val topic = AppConfig.ntfyTopic(ctx)
@@ -124,6 +146,11 @@ class NtfyWatcher(
 
     private fun scheduleReconnect(reason: String) {
         if (!running) return
+        // onClosed() and onFailure() can both fire for the same EventSource (e.g. a failure
+        // that immediately triggers a close); without clearing pending callbacks first, that
+        // piles up duplicate reconnect timers which would eventually open multiple concurrent
+        // SSE connections to the same topic.
+        handler.removeCallbacksAndMessages(null)
         Log.i(TAG, "Reconnect in ${backoffMs}ms ($reason)")
         handler.postDelayed({
             backoffMs = min(backoffMs * 2, 60_000L)

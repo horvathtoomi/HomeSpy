@@ -114,6 +114,28 @@ object DashboardHtml {
     </div>
   </div>
 
+  <!-- Live Monitor -->
+  <div class="card" id="liveMonitorCard" style="display:none;">
+    <div class="card-title">
+      <span>🔴 Live Monitor</span>
+      <span id="snapshotMeta" style="font-size:0.75rem; color: var(--muted);">--</span>
+    </div>
+    <div style="position:relative; background:#000; border-radius:8px; overflow:hidden; display:flex; align-items:center; justify-content:center;">
+      <img id="liveSnapshot" style="width:100%; display:block; max-height:480px; object-fit:contain; background:#000;" alt="live snapshot">
+    </div>
+    <audio id="liveAudio" controls style="width:100%;"></audio>
+    <div class="btn-row">
+      <button class="btn-secondary" id="btnMuteAudio" onclick="toggleMute()">🔊 Mute Live Audio</button>
+      <button class="btn-secondary" onclick="saveSnapshot()">📸 Save Snapshot</button>
+      <button class="btn-secondary" onclick="goFullscreen()">🖥️ Fullscreen</button>
+      <select id="selRefreshRate" onchange="restartSnapshotLoop()" style="flex: 0 0 110px;">
+        <option value="500">2 fps</option>
+        <option value="1000" selected>1 fps</option>
+        <option value="2000">0.5 fps</option>
+      </select>
+    </div>
+  </div>
+
   <!-- Stream Controls -->
   <div class="card">
     <div class="card-title">Stream Controls & Configuration</div>
@@ -237,6 +259,91 @@ object DashboardHtml {
     } else {
       banner.style.display = 'none';
     }
+
+    // Keep the Live Monitor (snapshot + continuous audio) in sync with the real device
+    // state, so opening/reloading the dashboard mid-stream picks it up automatically too,
+    // not just a fresh START click.
+    if (state === 'STREAMING' && !liveMonitorActive) {
+      startLiveMonitor();
+    } else if (state !== 'STREAMING' && liveMonitorActive) {
+      stopLiveMonitor();
+    }
+  }
+
+  // ---- Live Monitor: snapshot polling + continuous audio ----
+  let liveMonitorActive = false;
+  let snapshotTimer = null;
+  let snapshotFrameCount = 0;
+  let audioMuted = false;
+
+  function startLiveMonitor() {
+    if (liveMonitorActive) return;
+    liveMonitorActive = true;
+    document.getElementById('liveMonitorCard').style.display = 'flex';
+    const token = tokenInput.value.trim();
+    const audio = document.getElementById('liveAudio');
+    audio.src = '/api/audio.wav?auth_token=' + encodeURIComponent(token) + '&t=' + Date.now();
+    audio.muted = audioMuted;
+    audio.play().catch(() => { /* autoplay may need a user gesture on some browsers */ });
+    snapshotFrameCount = 0;
+    loadSnapshot();
+  }
+
+  function stopLiveMonitor() {
+    liveMonitorActive = false;
+    document.getElementById('liveMonitorCard').style.display = 'none';
+    const audio = document.getElementById('liveAudio');
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+    if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
+  }
+
+  function restartSnapshotLoop() {
+    if (snapshotTimer) { clearTimeout(snapshotTimer); snapshotTimer = null; }
+    if (liveMonitorActive) loadSnapshot();
+  }
+
+  function loadSnapshot() {
+    if (!liveMonitorActive) return;
+    const token = tokenInput.value.trim();
+    if (!token) return;
+    const rate = parseInt(document.getElementById('selRefreshRate').value, 10) || 1000;
+    const next = new Image();
+    next.onload = () => {
+      document.getElementById('liveSnapshot').src = next.src;
+      snapshotFrameCount++;
+      document.getElementById('snapshotMeta').innerText =
+        'Frame #' + snapshotFrameCount + ' @ ' + new Date().toLocaleTimeString();
+      if (liveMonitorActive) snapshotTimer = setTimeout(loadSnapshot, rate);
+    };
+    next.onerror = () => {
+      if (liveMonitorActive) snapshotTimer = setTimeout(loadSnapshot, rate);
+    };
+    next.src = '/api/snapshot.jpg?auth_token=' + encodeURIComponent(token) + '&t=' + Date.now();
+  }
+
+  function toggleMute() {
+    const audio = document.getElementById('liveAudio');
+    audioMuted = !audio.muted;
+    audio.muted = audioMuted;
+    document.getElementById('btnMuteAudio').innerText = audioMuted ? '🔇 Unmute Live Audio' : '🔊 Mute Live Audio';
+  }
+
+  function saveSnapshot() {
+    const img = document.getElementById('liveSnapshot');
+    if (!img.src) return;
+    const a = document.createElement('a');
+    a.href = img.src;
+    a.download = 'snapshot_' + Date.now() + '.jpg';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  function goFullscreen() {
+    const img = document.getElementById('liveSnapshot');
+    if (img.requestFullscreen) img.requestFullscreen();
   }
 
   async function sendAction(action) {
@@ -267,6 +374,11 @@ object DashboardHtml {
       const data = await res.json();
       if (res.ok && data.ok) {
         logMsg(`Action ${'$'}{action} accepted! State: ${'$'}{data.state}`);
+        if (action === 'START' && data.state === 'STREAMING') {
+          startLiveMonitor();
+        } else if (action === 'STOP') {
+          stopLiveMonitor();
+        }
       } else {
         logMsg(`Action ${'$'}{action} rejected: ${'$'}{data.error || 'Unknown error'}`);
       }

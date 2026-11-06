@@ -43,6 +43,8 @@ class MonitorService : Service(), ConnectChecker {
         @Volatile var instance: MonitorService? = null
     }
 
+    val webStreamer: DirectWebStreamer? get() = directWebStreamer
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mutex = Mutex()
     private var watchdogJob: Job? = null
@@ -57,10 +59,15 @@ class MonitorService : Service(), ConnectChecker {
     private var ntfyWatcher: NtfyWatcher? = null
     private var mqttWatcher: MqttWatcher? = null
 
+    // Ntfy sends a keepalive roughly every ~45-55s; a bounded read timeout (instead of
+    // infinite) lets OkHttp detect a silently-dropped mobile/NAT connection quickly via a
+    // read timeout + onFailure/reconnect, rather than hanging for hours on a half-open socket.
     private val sseClient = OkHttpClient.Builder()
-        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
+
+    private var directWebStreamer: DirectWebStreamer? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -82,6 +89,8 @@ class MonitorService : Service(), ConnectChecker {
 
         mqttWatcher = MqttWatcher(this) { payload -> applyPayload(payload) }
         mqttWatcher?.start()
+
+        directWebStreamer = DirectWebStreamer(this, sseClient, ntfyWatcher)
 
         updateNotification("IDLE")
     }
@@ -136,6 +145,11 @@ class MonitorService : Service(), ConnectChecker {
             Log.w(TAG, MonitorBus.lastError)
             return
         }
+        if (MonitorBus.activePayload?.mode == "AUDIO_ONLY") {
+            MonitorBus.lastError = "Cannot switch camera: audio-only mode has no active camera"
+            Log.w(TAG, MonitorBus.lastError)
+            return
+        }
         val streamer = activeStreamer() ?: run {
             MonitorBus.lastError = "No active streamer"
             Log.w(TAG, MonitorBus.lastError)
@@ -160,6 +174,11 @@ class MonitorService : Service(), ConnectChecker {
     private fun handleTorch(enable: Boolean) {
         if (MonitorBus.state != MonitorState.STREAMING) {
             MonitorBus.lastError = "Cannot toggle torch: not streaming"
+            Log.w(TAG, MonitorBus.lastError)
+            return
+        }
+        if (MonitorBus.activePayload?.mode == "AUDIO_ONLY") {
+            MonitorBus.lastError = "Cannot toggle torch: audio-only mode has no active camera"
             Log.w(TAG, MonitorBus.lastError)
             return
         }
@@ -213,6 +232,11 @@ class MonitorService : Service(), ConnectChecker {
                 }
                 scheduleWatchdog(payload.durationSeconds)
                 Log.i(TAG, "Streaming started: mode=${payload.mode} target=${MonitorBus.streamUrl} bitrate=${payload.videoBitrateKbps}k fps=${payload.fps}")
+                try {
+                    directWebStreamer?.start(activeStreamer(), payload)
+                } catch (e: Exception) {
+                    Log.w(TAG, "DirectWebStreamer start failed: ${e.message}")
+                }
                 publishStatusReply()
             } else {
                 MonitorBus.lastError = "Failed to prepare/start stream"
@@ -277,11 +301,7 @@ class MonitorService : Service(), ConnectChecker {
         val target = payload.streamTarget.trim()
         val useServer = target.isEmpty()
 
-        val (w, h) = when (payload.videoResolution.lowercase()) {
-            "1080p", "1920x1080" -> 1920 to 1080
-            "480p", "854x480" -> 854 to 480
-            else -> 1280 to 720
-        }
+        val (w, h) = resolveVideoResolution(payload.videoResolution)
 
         val bitrateBps = payload.videoBitrateKbps * 1024
         val fps = payload.fps
@@ -293,18 +313,18 @@ class MonitorService : Service(), ConnectChecker {
             server.getStreamClient().setAuthorization("admin", token)
 
             var audioOk = true
-            var videoOk = true
-
             if (!isVideoOnly) {
                 audioOk = server.prepareAudio(64 * 1024, 32000, true, false, false)
             }
-            if (!isAudioOnly) {
-                videoOk = server.prepareVideo(w, h, fps, bitrateBps, 0, 90)
-            }
+            // RootEncoder's startStream()/startEncoders() unconditionally starts the video
+            // encoder regardless of mode; setOnlyAudio() only suppresses it on the wire, not
+            // at prepare/start time. Leaving it unprepared in AUDIO_ONLY mode throws
+            // "VideoEncoder not prepared yet" from startStream() below, so it must always be
+            // prepared (the camera itself still stays untouched since startPreview() below
+            // remains gated on !isAudioOnly).
+            val videoOk = server.prepareVideo(w, h, fps, bitrateBps, 0, 90)
 
-            if (isAudioOnly && !audioOk) return false
-            if (isVideoOnly && !videoOk) return false
-            if (!isAudioOnly && !isVideoOnly && (!audioOk || !videoOk)) return false
+            if (!audioOk || !videoOk) return false
 
             server.getStreamClient().setOnlyAudio(isAudioOnly)
             server.getStreamClient().setOnlyVideo(isVideoOnly)
@@ -346,18 +366,14 @@ class MonitorService : Service(), ConnectChecker {
         bitrateBps: Int
     ): Boolean {
         var audioOk = true
-        var videoOk = true
-
         if (!isVideoOnly) {
             audioOk = client.prepareAudio(64 * 1024, 32000, true, false, false)
         }
-        if (!isAudioOnly) {
-            videoOk = client.prepareVideo(w, h, fps, bitrateBps, 0, 90)
-        }
+        // Same RootEncoder constraint as the built-in server path: the video encoder must
+        // always be prepared even in AUDIO_ONLY mode, or startStream() throws.
+        val videoOk = client.prepareVideo(w, h, fps, bitrateBps, 0, 90)
 
-        if (isAudioOnly && !audioOk) return false
-        if (isVideoOnly && !videoOk) return false
-        if (!isAudioOnly && !isVideoOnly && (!audioOk || !videoOk)) return false
+        if (!audioOk || !videoOk) return false
 
         streamClient.setOnlyAudio(isAudioOnly)
         streamClient.setOnlyVideo(isVideoOnly)
@@ -390,6 +406,7 @@ class MonitorService : Service(), ConnectChecker {
     }
 
     private fun cleanupStreamers() {
+        try { directWebStreamer?.stop() } catch (_: Exception) {}
         try { rtspServer?.let { it.stopStream(); it.stopPreview() } } catch (_: Exception) {}
         try { rtspClient?.let { it.stopStream(); it.stopPreview() } } catch (_: Exception) {}
         try { rtmpClient?.let { it.stopStream(); it.stopPreview() } } catch (_: Exception) {}

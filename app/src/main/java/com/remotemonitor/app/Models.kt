@@ -54,7 +54,10 @@ data class ControlPayload(
     val streamTarget: String = "",
     val torch: Boolean = false,
     val videoBitrateKbps: Int = 1500,
-    val fps: Int = 30
+    val fps: Int = 30,
+    val callbackUrl: String = "",
+    val ntfyPushSnapshots: Boolean = false,
+    val snapshotIntervalMs: Long = 1000
 ) {
     companion object {
         fun fromJson(obj: JSONObject): ControlPayload {
@@ -68,6 +71,9 @@ data class ControlPayload(
             val rawFps = obj.optInt("fps", 30)
             val fpsClamped = rawFps.coerceIn(10, 60)
 
+            val rawSnapshotInterval = obj.optLong("snapshot_interval_ms", 1000)
+            val snapshotIntervalClamped = rawSnapshotInterval.coerceIn(200, 60_000)
+
             return ControlPayload(
                 authToken = obj.optString("auth_token", ""),
                 action = obj.optString("action", "STATUS").uppercase(),
@@ -78,7 +84,10 @@ data class ControlPayload(
                 streamTarget = obj.optString("stream_target", ""),
                 torch = obj.optBoolean("torch", false),
                 videoBitrateKbps = bitrateClamped,
-                fps = fpsClamped
+                fps = fpsClamped,
+                callbackUrl = obj.optString("callback_url", ""),
+                ntfyPushSnapshots = obj.optBoolean("ntfy_push_snapshots", false),
+                snapshotIntervalMs = snapshotIntervalClamped
             )
         }
 
@@ -86,6 +95,13 @@ data class ControlPayload(
             fromJson(JSONObject(raw))
         } catch (_: Exception) { null }
     }
+}
+
+/** Shared video resolution mapping, used both for the RootEncoder stream and the DirectWebStreamer snapshot capture. */
+fun resolveVideoResolution(res: String): Pair<Int, Int> = when (res.lowercase()) {
+    "1080p", "1920x1080" -> 1920 to 1080
+    "480p", "854x480" -> 854 to 480
+    else -> 1280 to 720
 }
 
 object MonitorBus {
