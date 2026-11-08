@@ -355,6 +355,14 @@ object DashboardHtml {
         <span class="metric-label">Primary IP</span>
         <span class="metric-value" id="statIp" style="font-size:0.88rem;">--</span>
       </div>
+      <div class="metric-cell">
+        <span class="metric-label">Temperature</span>
+        <span class="metric-value" id="statTemp">--</span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">Recording</span>
+        <span class="metric-value" id="statRecording">OFF</span>
+      </div>
     </div>
 
     <div id="streamBanner" class="stream-banner" style="display:none;">
@@ -438,6 +446,18 @@ object DashboardHtml {
         <label class="form-label" for="txtTarget">Push Target URL (Leave empty for Built-in RTSP Server on :8554)</label>
         <input type="text" id="txtTarget" placeholder="rtsp://... or rtmp://... (optional)">
       </div>
+      <div class="form-item">
+        <label class="form-label" for="numVox">VOX Threshold (dB, 0 = off)</label>
+        <input type="number" id="numVox" value="0" min="-60" max="0" step="1">
+      </div>
+      <div class="form-item">
+        <label class="form-label" for="numMotion">Motion Sensitivity (0 = off, 1-100)</label>
+        <input type="number" id="numMotion" value="0" min="0" max="100" step="1">
+      </div>
+      <div class="form-item" style="flex-direction:row; align-items:center; gap:8px;">
+        <input type="checkbox" id="chkRecordLocally" style="width:auto;">
+        <label class="form-label" for="chkRecordLocally" style="margin:0;">Record locally on Start</label>
+      </div>
     </div>
 
     <div class="action-deck">
@@ -457,7 +477,35 @@ object DashboardHtml {
         <svg viewBox="0 0 24 24" stroke-width="2"><path d="M18 6h-2a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2H6a2 2 0 0 0-2 2v2l3 3v7a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2v-7l3-3V8a2 2 0 0 0-2-2z"/></svg>
         <span id="torchBtnText">Torch ON</span>
       </button>
+      <button onclick="sendAction('AUTOFOCUS')">Autofocus</button>
+      <button id="recordBtn" onclick="toggleRecording()">Record Start</button>
     </div>
+    <div class="form-item">
+      <label class="form-label" for="rngZoom">Zoom: <span id="zoomVal">1.0x</span></label>
+      <input type="range" id="rngZoom" min="1" max="8" step="0.1" value="1" oninput="onZoomInput(this.value)">
+    </div>
+  </div>
+
+  <!-- Push-to-Talk -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-label">Push-to-Talk</span>
+      <span id="talkStatus" style="font-size:0.7rem; color:var(--text-muted);">Idle</span>
+    </div>
+    <div class="action-deck">
+      <button id="talkBtn" class="btn-start" onmousedown="startTalk()" onmouseup="stopTalk()" onmouseleave="stopTalk()" ontouchstart="startTalk()" ontouchend="stopTalk()">
+        Hold to Talk
+      </button>
+    </div>
+  </div>
+
+  <!-- Recordings -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-label">Recordings</span>
+      <button class="btn-secondary" onclick="loadRecordings()">Refresh</button>
+    </div>
+    <div id="recordingsList" class="console-box" style="max-height:200px;">No recordings loaded.</div>
   </div>
 
   <!-- Activity Console -->
@@ -543,6 +591,22 @@ object DashboardHtml {
 
     const ip = d.ips?.wifi || d.ips?.best || '--';
     document.getElementById('statIp').innerText = ip;
+
+    const temp = d.temperature_c;
+    document.getElementById('statTemp').innerText = (temp !== undefined && temp !== null) ? temp.toFixed(1) + ' C' : '--';
+
+    const recording = !!d.is_recording;
+    document.getElementById('statRecording').innerText = recording ? 'ON' : 'OFF';
+    const recordBtn = document.getElementById('recordBtn');
+    if (recordBtn) {
+      recordBtn.innerText = recording ? 'Record Stop' : 'Record Start';
+      recordBtn.classList.toggle('btn-active', recording);
+    }
+
+    if (typeof d.zoom_level === 'number' && !zoomSliderDragging) {
+      document.getElementById('rngZoom').value = d.zoom_level;
+      document.getElementById('zoomVal').innerText = d.zoom_level.toFixed(1) + 'x';
+    }
 
     const banner = document.getElementById('streamBanner');
     const link = document.getElementById('streamLink');
@@ -659,7 +723,14 @@ object DashboardHtml {
       video_bitrate_kbps: parseInt(document.getElementById('numBitrate').value, 10) || 1500,
       fps: parseInt(document.getElementById('numFps').value, 10) || 30,
       duration_seconds: parseInt(document.getElementById('numDuration').value, 10) || 0,
-      stream_target: document.getElementById('txtTarget').value.trim()
+      stream_target: document.getElementById('txtTarget').value.trim(),
+      vox_threshold_db: parseInt(document.getElementById('numVox').value, 10) || 0,
+      motion_sensitivity: parseInt(document.getElementById('numMotion').value, 10) || 0,
+      record_locally: document.getElementById('chkRecordLocally').checked
+      // web_audio_enabled intentionally omitted (defaults false): when stream_target is a
+      // remote RTSP/RTMP push, DirectWebStreamer's AudioRecord must stay off to avoid mic
+      // contention with RootEncoder's own prepareAudio(). It's a no-op for the DIRECT/built-in
+      // path, which always gets local audio regardless of this flag.
     };
 
     logMsg(`Dispatching ${'$'}{action}...`, 'info');
@@ -697,8 +768,217 @@ object DashboardHtml {
     }
   }
 
+  // ---- Zoom ----
+  let zoomSliderDragging = false;
+  let zoomDebounceTimer = null;
+  document.getElementById('rngZoom').addEventListener('pointerdown', () => { zoomSliderDragging = true; });
+  document.getElementById('rngZoom').addEventListener('pointerup', () => { zoomSliderDragging = false; });
+
+  function onZoomInput(val) {
+    document.getElementById('zoomVal').innerText = parseFloat(val).toFixed(1) + 'x';
+    if (zoomDebounceTimer) clearTimeout(zoomDebounceTimer);
+    zoomDebounceTimer = setTimeout(() => sendZoom(parseFloat(val)), 150);
+  }
+
+  async function sendZoom(level) {
+    const token = tokenInput.value.trim();
+    if (!token) return;
+    try {
+      await fetch('/api/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auth_token: token, action: 'SET_ZOOM', zoom_level: level })
+      });
+    } catch (e) {
+      logMsg('Zoom command failed: ' + e.message, 'err');
+    }
+  }
+
+  // ---- Recording ----
+  function toggleRecording() {
+    const recording = document.getElementById('recordBtn').classList.contains('btn-active');
+    sendAction(recording ? 'RECORD_STOP' : 'RECORD_START');
+  }
+
+  async function loadRecordings() {
+    const token = tokenInput.value.trim();
+    if (!token) return;
+    const box = document.getElementById('recordingsList');
+    try {
+      const res = await fetch('/api/recordings', { headers: { 'Authorization': 'Bearer ' + token } });
+      if (!res.ok) { box.innerText = 'Failed to load (HTTP ' + res.status + ')'; return; }
+      const data = await res.json();
+      const files = data.files || [];
+      if (files.length === 0) { box.innerText = 'No recordings yet.'; return; }
+      box.innerHTML = '';
+      files.slice().reverse().forEach((f) => {
+        const row = document.createElement('div');
+        const sizeMb = (f.size_bytes / (1024 * 1024)).toFixed(1);
+        const when = new Date(f.modified_ms).toLocaleString();
+        row.style.display = 'flex';
+        row.style.justifyContent = 'space-between';
+        row.style.gap = '8px';
+        row.style.padding = '4px 0';
+        const label = document.createElement('span');
+        label.innerText = f.name + ' (' + sizeMb + ' MB, ' + when + ')';
+        const actions = document.createElement('span');
+        const dl = document.createElement('a');
+        dl.innerText = 'Download';
+        dl.href = '/api/recordings/' + encodeURIComponent(f.name) + '?auth_token=' + encodeURIComponent(token);
+        dl.style.marginRight = '10px';
+        dl.style.color = '#93c5fd';
+        const del = document.createElement('a');
+        del.innerText = 'Delete';
+        del.href = '#';
+        del.style.color = '#fca5a5';
+        del.onclick = (e) => { e.preventDefault(); deleteRecording(f.name); };
+        actions.appendChild(dl);
+        actions.appendChild(del);
+        row.appendChild(label);
+        row.appendChild(actions);
+        box.appendChild(row);
+      });
+    } catch (e) {
+      box.innerText = 'Network error: ' + e.message;
+    }
+  }
+
+  async function deleteRecording(name) {
+    const token = tokenInput.value.trim();
+    if (!token) return;
+    try {
+      await fetch('/api/recordings/' + encodeURIComponent(name), {
+        method: 'DELETE',
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+      logMsg('Deleted recording ' + name, 'ok');
+      loadRecordings();
+    } catch (e) {
+      logMsg('Delete failed: ' + e.message, 'err');
+    }
+  }
+
+  // ---- Push-to-Talk ----
+  let talkCtx = null, talkStream = null, talkProcessor = null, talkSource = null;
+  let talkChunks = [];
+  let talkSampleRate = 16000;
+  let talkActive = false;
+
+  async function startTalk() {
+    if (talkActive) return;
+    talkActive = true;
+    try {
+      talkStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      talkCtx = new (window.AudioContext || window.webkitAudioContext)();
+      talkSampleRate = talkCtx.sampleRate;
+      talkSource = talkCtx.createMediaStreamSource(talkStream);
+      talkProcessor = talkCtx.createScriptProcessor(4096, 1, 1);
+      talkChunks = [];
+      talkProcessor.onaudioprocess = (e) => {
+        talkChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      };
+      talkSource.connect(talkProcessor);
+      talkProcessor.connect(talkCtx.destination);
+      document.getElementById('talkBtn').classList.add('btn-active');
+      document.getElementById('talkStatus').innerText = 'Recording...';
+    } catch (e) {
+      talkActive = false;
+      logMsg('Mic access failed: ' + e.message, 'err');
+    }
+  }
+
+  async function stopTalk() {
+    if (!talkActive) return;
+    talkActive = false;
+    try {
+      talkProcessor.disconnect();
+      talkSource.disconnect();
+      talkStream.getTracks().forEach((t) => t.stop());
+      const srcRate = talkSampleRate;
+      const merged = mergeFloat32(talkChunks);
+      await talkCtx.close();
+      talkCtx = null;
+      document.getElementById('talkBtn').classList.remove('btn-active');
+      document.getElementById('talkStatus').innerText = 'Sending...';
+      const pcm16 = downsampleTo16kMono(merged, srcRate);
+      const wavBlob = encodeWav(pcm16, 16000);
+      const token = tokenInput.value.trim();
+      const res = await fetch('/api/talk', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'audio/wav' },
+        body: wavBlob
+      });
+      document.getElementById('talkStatus').innerText = 'Idle';
+      if (res.ok) logMsg('Talk clip sent', 'ok'); else logMsg('Talk send failed: HTTP ' + res.status, 'err');
+    } catch (e) {
+      document.getElementById('talkStatus').innerText = 'Idle';
+      logMsg('Talk send error: ' + e.message, 'err');
+    }
+  }
+
+  function mergeFloat32(chunks) {
+    let len = 0;
+    chunks.forEach((c) => { len += c.length; });
+    const out = new Float32Array(len);
+    let offset = 0;
+    chunks.forEach((c) => { out.set(c, offset); offset += c.length; });
+    return out;
+  }
+
+  function downsampleTo16kMono(float32, srcRate) {
+    const dstRate = 16000;
+    if (srcRate === dstRate) return floatTo16BitPCM(float32);
+    const ratio = srcRate / dstRate;
+    const newLen = Math.round(float32.length / ratio);
+    const result = new Float32Array(newLen);
+    let offsetResult = 0, offsetBuffer = 0;
+    while (offsetResult < newLen) {
+      const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+      let accum = 0, count = 0;
+      for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32.length; i++) { accum += float32[i]; count++; }
+      result[offsetResult] = count > 0 ? accum / count : 0;
+      offsetResult++;
+      offsetBuffer = nextOffsetBuffer;
+    }
+    return floatTo16BitPCM(result);
+  }
+
+  function floatTo16BitPCM(float32) {
+    const out = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      let s = Math.max(-1, Math.min(1, float32[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return out;
+  }
+
+  function encodeWav(pcm16, sampleRate) {
+    const buffer = new ArrayBuffer(44 + pcm16.length * 2);
+    const view = new DataView(buffer);
+    function writeStr(offset, str) {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    }
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + pcm16.length * 2, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    view.setUint32(40, pcm16.length * 2, true);
+    let offset = 44;
+    for (let i = 0; i < pcm16.length; i++, offset += 2) { view.setInt16(offset, pcm16[i], true); }
+    return new Blob([buffer], { type: 'audio/wav' });
+  }
+
   fetchStatus();
   setInterval(fetchStatus, 2000);
+  loadRecordings();
 </script>
 </body>
 </html>"""

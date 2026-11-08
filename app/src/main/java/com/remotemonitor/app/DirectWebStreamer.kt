@@ -40,7 +40,8 @@ import kotlin.concurrent.thread
 class DirectWebStreamer(
     private val ctx: Context,
     private val httpClient: OkHttpClient,
-    private val ntfyWatcher: NtfyWatcher?
+    private val ntfyWatcher: NtfyWatcher?,
+    private val mqttWatcher: MqttWatcher? = null
 ) {
     companion object {
         private const val TAG = "RM-WebStreamer"
@@ -52,6 +53,14 @@ class DirectWebStreamer(
         // Safety cap for the ntfy push buffer in case pushes stall for a while — drop the
         // oldest half rather than grow unbounded.
         private const val NTFY_AUDIO_MAX_BYTES = SAMPLE_RATE * 2 * 10
+        // Sentinel mode: both alert kinds share this floor so a noisy/busy scene can't spam
+        // the ntfy/MQTT relay.
+        private const val ALERT_THROTTLE_MS = 30_000L
+        // How long a sound level must stay above vox_threshold_db before it counts as an event,
+        // instead of firing on a single loud transient.
+        private const val VOX_SUSTAIN_MS = 500L
+        private const val MOTION_GRID_COLS = 32
+        private const val MOTION_GRID_ROWS = 24
     }
 
     @Volatile var latestJpeg: ByteArray? = null
@@ -69,6 +78,14 @@ class DirectWebStreamer(
 
     @Volatile private var lastCaptureMs = 0L
     @Volatile private var captureIntervalMs = 1000L
+
+    // ---- sentinel mode (VOX + motion) ----
+    @Volatile private var voxThresholdDb = 0
+    @Volatile private var motionSensitivity = 0
+    @Volatile private var soundAboveSinceMs = 0L
+    @Volatile private var lastSoundAlertMs = 0L
+    @Volatile private var lastMotionAlertMs = 0L
+    @Volatile private var previousMotionGrid: FloatArray? = null
 
     private val audioClients = CopyOnWriteArrayList<LinkedBlockingQueue<ByteArray>>()
     private val mjpegClients = CopyOnWriteArrayList<LinkedBlockingQueue<ByteArray>>()
@@ -119,6 +136,7 @@ class DirectWebStreamer(
                         thread(name = "RM-JpegEncode") {
                             val jpeg = yuv420888ToJpeg(snapshot, JPEG_QUALITY)
                             if (jpeg != null) publishJpeg(jpeg, now)
+                            if (motionSensitivity > 0) checkMotion(snapshot, jpeg)
                         }
                     }
                     else -> {
@@ -139,14 +157,25 @@ class DirectWebStreamer(
         offerToClients(mjpegClients, jpeg)
     }
 
-    /** Begin serving snapshots/audio for the current streaming session. Call after the RootEncoder stream has started. */
-    fun start(cam: Camera2Base?, payload: ControlPayload) {
+    /**
+     * Begin serving snapshots/audio for the current streaming session. Call after the RootEncoder
+     * stream has started. [isDirectTarget] is true when there is no external RTSP/RTMP push (the
+     * built-in server or no server at all) — only then does DirectWebStreamer open its own
+     * AudioRecord unconditionally, since in push mode RootEncoder's own prepareAudio() already
+     * owns the mic and a second AudioRecord would contend with it. In push mode, local/relay
+     * audio still runs if explicitly requested via ntfyPushSnapshots or webAudioEnabled.
+     */
+    fun start(cam: Camera2Base?, payload: ControlPayload, isDirectTarget: Boolean = true) {
         stop()
         val mode = payload.mode
         val isAudioOnly = mode == "AUDIO_ONLY"
         val isVideoOnly = mode == "VIDEO_ONLY"
         captureIntervalMs = payload.snapshotIntervalMs.coerceAtLeast(200L)
         ntfyPushActive = payload.ntfyPushSnapshots
+        voxThresholdDb = payload.voxThresholdDb
+        motionSensitivity = payload.motionSensitivity
+        soundAboveSinceMs = 0L
+        previousMotionGrid = null
         synchronized(ntfyAudioLock) { ntfyAudioBuffer.reset() }
 
         if (!isAudioOnly && cam != null) {
@@ -160,8 +189,11 @@ class DirectWebStreamer(
             }
         }
 
-        if (!isVideoOnly) {
+        val wantAudio = !isVideoOnly && (isDirectTarget || payload.ntfyPushSnapshots || payload.webAudioEnabled)
+        if (wantAudio) {
             startAudioCapture()
+        } else if (!isVideoOnly) {
+            Log.i(TAG, "Skipping DirectWebStreamer AudioRecord: external push target owns the mic (webAudioEnabled/ntfyPushSnapshots not requested)")
         }
 
         if (payload.callbackUrl.isNotBlank() || payload.ntfyPushSnapshots) {
@@ -311,6 +343,7 @@ class DirectWebStreamer(
                     if (n > 0) {
                         val piece = chunk.copyOf(n)
                         offerToClients(audioClients, piece)
+                        if (voxThresholdDb != 0) checkVox(piece)
                         synchronized(packLock) {
                             val combined = packAudioBuffer + piece
                             packAudioBuffer = if (combined.size > PACK_AUDIO_MAX_BYTES) {
@@ -358,6 +391,117 @@ class DirectWebStreamer(
     private fun closeAllClients(clients: CopyOnWriteArrayList<LinkedBlockingQueue<ByteArray>>) {
         for (q in clients) q.offer(STREAM_END)
         clients.clear()
+    }
+
+    // ---- sentinel: sound (VOX) + motion detection ----
+
+    /** RMS decibel level of a PCM16 chunk relative to full scale (0 dB = max amplitude, more negative = quieter). */
+    private fun rmsDb(pcm16: ByteArray): Double {
+        val sampleCount = pcm16.size / 2
+        if (sampleCount <= 0) return -96.0
+        var sumSquares = 0.0
+        var i = 0
+        while (i + 1 < pcm16.size) {
+            val lo = pcm16[i].toInt() and 0xFF
+            val hi = pcm16[i + 1].toInt()
+            val sample = ((hi shl 8) or lo).toShort().toDouble()
+            sumSquares += sample * sample
+            i += 2
+        }
+        val rms = Math.sqrt(sumSquares / sampleCount)
+        if (rms <= 0.0) return -96.0
+        return 20.0 * Math.log10(rms / 32768.0)
+    }
+
+    private fun checkVox(piece: ByteArray) {
+        val db = rmsDb(piece)
+        val now = System.currentTimeMillis()
+        if (db > voxThresholdDb) {
+            if (soundAboveSinceMs == 0L) soundAboveSinceMs = now
+            if (now - soundAboveSinceMs >= VOX_SUSTAIN_MS && now - lastSoundAlertMs >= ALERT_THROTTLE_MS) {
+                lastSoundAlertMs = now
+                publishAlert("sound", JSONObject().apply { put("db", db) })
+            }
+        } else {
+            soundAboveSinceMs = 0L
+        }
+    }
+
+    /** Downsamples the Y (luma) plane to a MOTION_GRID_COLS x MOTION_GRID_ROWS block-average grid. */
+    private fun computeMotionGrid(snap: YuvSnapshot): FloatArray {
+        val grid = FloatArray(MOTION_GRID_COLS * MOTION_GRID_ROWS)
+        val blockW = (snap.width / MOTION_GRID_COLS).coerceAtLeast(1)
+        val blockH = (snap.height / MOTION_GRID_ROWS).coerceAtLeast(1)
+        for (gy in 0 until MOTION_GRID_ROWS) {
+            for (gx in 0 until MOTION_GRID_COLS) {
+                var sum = 0L
+                var count = 0
+                val yStart = gy * blockH
+                val xStart = gx * blockW
+                val yEnd = minOf(yStart + blockH, snap.height)
+                val xEnd = minOf(xStart + blockW, snap.width)
+                var y = yStart
+                while (y < yEnd) {
+                    var x = xStart
+                    val rowBase = y * snap.width
+                    while (x < xEnd) {
+                        val idx = rowBase + x
+                        if (idx < snap.yBytes.size) {
+                            sum += (snap.yBytes[idx].toInt() and 0xFF)
+                            count++
+                        }
+                        x++
+                    }
+                    y++
+                }
+                grid[gy * MOTION_GRID_COLS + gx] = if (count > 0) sum.toFloat() / count else 0f
+            }
+        }
+        return grid
+    }
+
+    /** Called off the camera callback thread (already running in the background JPEG-encode thread) for each YUV frame. */
+    private fun checkMotion(snap: YuvSnapshot, jpegForAlert: ByteArray?) {
+        val grid = computeMotionGrid(snap)
+        val previous = previousMotionGrid
+        previousMotionGrid = grid
+        if (previous == null || previous.size != grid.size) return
+        var totalDelta = 0.0
+        for (i in grid.indices) totalDelta += Math.abs(grid[i] - previous[i])
+        val avgDelta = totalDelta / grid.size
+        // Higher sensitivity (1-100) means a smaller average pixel delta is enough to trigger.
+        val requiredDelta = (101 - motionSensitivity).coerceIn(1, 100) * 0.3f
+        val now = System.currentTimeMillis()
+        if (avgDelta > requiredDelta && now - lastMotionAlertMs >= ALERT_THROTTLE_MS) {
+            lastMotionAlertMs = now
+            publishAlert("motion", JSONObject().apply {
+                put("delta", avgDelta)
+                if (jpegForAlert != null) {
+                    val small = downscaleJpeg(jpegForAlert, 320, 240, 45) ?: jpegForAlert
+                    put("jpeg_b64", Base64.encodeToString(small, Base64.NO_WRAP))
+                }
+            })
+        }
+    }
+
+    private fun publishAlert(reason: String, extra: JSONObject) {
+        try {
+            val json = JSONObject().apply {
+                put("type", "alert")
+                put("reason", reason)
+                put("timestamp_ms", System.currentTimeMillis())
+                val keyIt = extra.keys()
+                while (keyIt.hasNext()) {
+                    val k = keyIt.next()
+                    put(k, extra.get(k))
+                }
+            }.toString()
+            ntfyWatcher?.publishStatus(json)
+            mqttWatcher?.publishStatus(json)
+            Log.i(TAG, "Sentinel alert: $reason")
+        } catch (e: Exception) {
+            Log.w(TAG, "publishAlert error: ${e.message}")
+        }
     }
 
     // ---- push mode (callback_url / ntfy snapshot push) ----

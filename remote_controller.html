@@ -128,6 +128,8 @@
       <div class="metric-cell"><span class="metric-label">Remaining</span><span class="metric-value" id="statRemaining">--</span></div>
       <div class="metric-cell"><span class="metric-label">Active Sensor</span><span class="metric-value" id="statCamera">--</span></div>
       <div class="metric-cell"><span class="metric-label">Torch</span><span class="metric-value" id="statTorch">OFF</span></div>
+      <div class="metric-cell"><span class="metric-label">Temperature</span><span class="metric-value" id="statTemp">--</span></div>
+      <div class="metric-cell"><span class="metric-label">Recording</span><span class="metric-value" id="statRecording">OFF</span></div>
       <div class="metric-cell"><span class="metric-label">Last Update</span><span class="metric-value" id="statUpdated" style="font-size:0.82rem;">--</span></div>
     </div>
   </div>
@@ -186,13 +188,54 @@
         <label class="form-label" for="txtTarget">Stream Target (leave empty / "DIRECT" for built-in server + web audio)</label>
         <input type="text" id="txtTarget" placeholder="DIRECT (default), or rtsp://... / rtmp://...">
       </div>
+      <div class="form-item">
+        <label class="form-label" for="numVox">VOX Threshold (dB, 0 = off)</label>
+        <input type="number" id="numVox" value="0" min="-60" max="0" step="1">
+      </div>
+      <div class="form-item">
+        <label class="form-label" for="numMotion">Motion Sensitivity (0 = off, 1-100)</label>
+        <input type="number" id="numMotion" value="0" min="0" max="100" step="1">
+      </div>
+      <div class="form-item" style="flex-direction:row; align-items:center; gap:8px;">
+        <input type="checkbox" id="chkRecordLocally" style="width:auto;">
+        <label class="form-label" for="chkRecordLocally" style="margin:0;">Record locally on Start</label>
+      </div>
     </div>
     <div class="action-deck">
       <button class="btn-start" onclick="sendAction('START')">Start Stream</button>
       <button class="btn-stop" onclick="sendAction('STOP')">Stop Stream</button>
       <button onclick="sendAction('SWITCH_CAMERA')">Switch Camera</button>
       <button id="torchBtn" onclick="toggleTorch()"><span id="torchBtnText">Torch ON</span></button>
+      <button onclick="sendAction('AUTOFOCUS')">Autofocus</button>
+      <button id="recordBtn" onclick="toggleRecording()">Record Start</button>
     </div>
+    <div class="form-item">
+      <label class="form-label" for="rngZoom">Zoom: <span id="zoomVal">1.0x</span></label>
+      <input type="range" id="rngZoom" min="1" max="8" step="0.1" value="1" oninput="onZoomInput(this.value)">
+    </div>
+  </div>
+
+  <!-- Push-to-Talk -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-label">Push-to-Talk</span>
+      <span id="talkStatus" style="font-size:0.7rem; color:var(--text-muted);">Idle</span>
+    </div>
+    <div class="action-deck">
+      <button id="talkBtn" class="btn-start" onmousedown="startTalk()" onmouseup="stopTalk()" onmouseleave="stopTalk()" ontouchstart="startTalk()" ontouchend="stopTalk()">
+        Hold to Talk
+      </button>
+    </div>
+    <div class="hint">Direct mode sends the clip straight to the phone over HTTP. Ntfy relay mode sends it as a short base64 clip through the public broker instead.</div>
+  </div>
+
+  <!-- Recordings -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-label">Recordings</span>
+      <button class="btn-secondary" onclick="loadRecordings()">Refresh</button>
+    </div>
+    <div id="recordingsList" class="console-box" style="max-height:200px;">Direct mode only. Connect directly to load recordings.</div>
   </div>
 
   <div class="card">
@@ -240,6 +283,7 @@ function switchMode(m) {
   document.getElementById('modeHint').innerText = m === 'direct'
     ? 'Direct mode talks straight to the phone\'s built-in HTTP server: live snapshot + continuous audio, lowest latency. Requires the phone to be reachable on your LAN, via Tailscale, or via a port-forward.'
     : 'Ntfy relay mode needs no IP address and works from anywhere, even mobile data: commands and status/snapshot pushes travel through the public ntfy.sh broker. No continuous audio over this path — only periodic image pushes (enable "Push Snapshots" on the phone/dashboard for this topic).';
+  loadRecordings();
 }
 
 function currentToken() {
@@ -283,6 +327,7 @@ function connectDirect() {
   pollStatusDirect();
   pollTimer = setInterval(pollStatusDirect, 2000);
   loadSnapshotDirect();
+  loadRecordings();
 }
 
 async function pollStatusDirect() {
@@ -413,6 +458,22 @@ function applyStatus(d) {
   const torchBtnText = document.getElementById('torchBtnText');
   if (lastTorchActive) { torchBtn.classList.add('btn-active'); torchBtnText.innerText = 'Torch OFF'; }
   else { torchBtn.classList.remove('btn-active'); torchBtnText.innerText = 'Torch ON'; }
+
+  const temp = d.temperature_c;
+  document.getElementById('statTemp').innerText = (temp !== undefined && temp !== null) ? Number(temp).toFixed(1) + ' C' : '--';
+
+  const recording = !!d.is_recording;
+  document.getElementById('statRecording').innerText = recording ? 'ON' : 'OFF';
+  const recordBtn = document.getElementById('recordBtn');
+  if (recordBtn) {
+    recordBtn.innerText = recording ? 'Record Stop' : 'Record Start';
+    recordBtn.classList.toggle('btn-active', recording);
+  }
+
+  if (typeof d.zoom_level === 'number' && !zoomSliderDragging) {
+    document.getElementById('rngZoom').value = d.zoom_level;
+    document.getElementById('zoomVal').innerText = d.zoom_level.toFixed(1) + 'x';
+  }
 }
 
 function toggleTorch() {
@@ -430,8 +491,274 @@ function buildPayload(action) {
     fps: parseInt(document.getElementById('numFps').value, 10) || 30,
     duration_seconds: parseInt(document.getElementById('numDuration').value, 10) || 0,
     stream_target: document.getElementById('txtTarget').value.trim(),
-    ntfy_push_snapshots: mode === 'ntfy'
+    ntfy_push_snapshots: mode === 'ntfy',
+    vox_threshold_db: parseInt(document.getElementById('numVox').value, 10) || 0,
+    motion_sensitivity: parseInt(document.getElementById('numMotion').value, 10) || 0,
+    record_locally: document.getElementById('chkRecordLocally').checked
   };
+}
+
+// ---- Zoom ----
+let zoomSliderDragging = false;
+let zoomDebounceTimer = null;
+document.getElementById('rngZoom').addEventListener('pointerdown', () => { zoomSliderDragging = true; });
+document.getElementById('rngZoom').addEventListener('pointerup', () => { zoomSliderDragging = false; });
+
+function onZoomInput(val) {
+  document.getElementById('zoomVal').innerText = parseFloat(val).toFixed(1) + 'x';
+  if (zoomDebounceTimer) clearTimeout(zoomDebounceTimer);
+  zoomDebounceTimer = setTimeout(() => sendZoom(parseFloat(val)), 150);
+}
+
+async function sendZoom(level) {
+  const payload = { auth_token: currentToken(), action: 'SET_ZOOM', zoom_level: level };
+  if (mode === 'ntfy') { await sendNtfyCommand(payload); return; }
+  const base = els.baseUrl.value.trim().replace(/\/$/, '');
+  if (!base) return;
+  try {
+    await fetch(`${base}/api/control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + currentToken() },
+      body: JSON.stringify(payload)
+    });
+  } catch (e) {
+    logMsg('Zoom command failed: ' + e.message, 'err');
+  }
+}
+
+// ---- Recording ----
+function toggleRecording() {
+  const recording = document.getElementById('recordBtn').classList.contains('btn-active');
+  sendAction(recording ? 'RECORD_STOP' : 'RECORD_START');
+}
+
+async function loadRecordings() {
+  const box = document.getElementById('recordingsList');
+  if (mode !== 'direct') { box.innerText = 'Direct mode only. Switch to Direct IP / Tailscale to load recordings.'; return; }
+  const base = els.baseUrl.value.trim().replace(/\/$/, '');
+  const token = currentToken();
+  if (!base || !token) { box.innerText = 'Connect first.'; return; }
+  try {
+    const res = await fetch(`${base}/api/recordings`, { headers: { 'Authorization': 'Bearer ' + token } });
+    if (!res.ok) { box.innerText = 'Failed to load (HTTP ' + res.status + ')'; return; }
+    const data = await res.json();
+    const files = data.files || [];
+    if (files.length === 0) { box.innerText = 'No recordings yet.'; return; }
+    box.innerHTML = '';
+    files.slice().reverse().forEach((f) => {
+      const row = document.createElement('div');
+      row.style.display = 'flex';
+      row.style.justifyContent = 'space-between';
+      row.style.gap = '8px';
+      row.style.padding = '4px 0';
+      const sizeMb = (f.size_bytes / (1024 * 1024)).toFixed(1);
+      const when = new Date(f.modified_ms).toLocaleString();
+      const label = document.createElement('span');
+      label.innerText = `${f.name} (${sizeMb} MB, ${when})`;
+      const actions = document.createElement('span');
+      const dl = document.createElement('a');
+      dl.innerText = 'Download';
+      dl.href = `${base}/api/recordings/${encodeURIComponent(f.name)}?auth_token=${encodeURIComponent(token)}`;
+      dl.style.marginRight = '10px';
+      dl.style.color = '#93c5fd';
+      const del = document.createElement('a');
+      del.innerText = 'Delete';
+      del.href = '#';
+      del.style.color = '#fca5a5';
+      del.onclick = (e) => { e.preventDefault(); deleteRecording(f.name); };
+      actions.appendChild(dl);
+      actions.appendChild(del);
+      row.appendChild(label);
+      row.appendChild(actions);
+      box.appendChild(row);
+    });
+  } catch (e) {
+    box.innerText = 'Network error: ' + e.message;
+  }
+}
+
+async function deleteRecording(name) {
+  const base = els.baseUrl.value.trim().replace(/\/$/, '');
+  const token = currentToken();
+  try {
+    await fetch(`${base}/api/recordings/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    logMsg('Deleted recording ' + name, 'ok');
+    loadRecordings();
+  } catch (e) {
+    logMsg('Delete failed: ' + e.message, 'err');
+  }
+}
+
+// ---- Push-to-Talk ----
+let talkCtx = null, talkStream = null, talkProcessor = null, talkSource = null;
+let talkChunks = [];
+let talkSampleRate = 16000;
+let talkActive = false;
+
+async function startTalk() {
+  if (talkActive) return;
+  talkActive = true;
+  try {
+    talkStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    talkCtx = new (window.AudioContext || window.webkitAudioContext)();
+    talkSampleRate = talkCtx.sampleRate;
+    talkSource = talkCtx.createMediaStreamSource(talkStream);
+    talkProcessor = talkCtx.createScriptProcessor(4096, 1, 1);
+    talkChunks = [];
+    talkProcessor.onaudioprocess = (e) => { talkChunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    talkSource.connect(talkProcessor);
+    talkProcessor.connect(talkCtx.destination);
+    document.getElementById('talkBtn').classList.add('btn-active');
+    document.getElementById('talkStatus').innerText = 'Recording...';
+  } catch (e) {
+    talkActive = false;
+    logMsg('Mic access failed: ' + e.message, 'err');
+  }
+}
+
+async function stopTalk() {
+  if (!talkActive) return;
+  talkActive = false;
+  try {
+    talkProcessor.disconnect();
+    talkSource.disconnect();
+    talkStream.getTracks().forEach((t) => t.stop());
+    const srcRate = talkSampleRate;
+    const merged = mergeFloat32(talkChunks);
+    await talkCtx.close();
+    talkCtx = null;
+    document.getElementById('talkBtn').classList.remove('btn-active');
+    document.getElementById('talkStatus').innerText = 'Sending...';
+    const pcm16 = downsampleTo16kMono(merged, srcRate);
+    const wavBlob = encodeWav(pcm16, 16000);
+
+    if (mode === 'ntfy') {
+      // The ntfy relay embeds the clip as base64 text inside the command JSON, so keep it small:
+      // 8kHz/8-bit mono instead of the 16kHz/16-bit WAV used for the direct HTTP path.
+      const compactBlob = buildCompactWavForRelay(merged, srcRate);
+      const b64 = await blobToBase64(compactBlob);
+      await sendNtfyCommand({ auth_token: currentToken(), action: 'TALK', talk_wav_b64: b64 });
+      document.getElementById('talkStatus').innerText = 'Idle';
+      logMsg('Talk clip published to ntfy topic', 'ok');
+      return;
+    }
+
+    const base = els.baseUrl.value.trim().replace(/\/$/, '');
+    const res = await fetch(`${base}/api/talk`, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + currentToken(), 'Content-Type': 'audio/wav' },
+      body: wavBlob
+    });
+    document.getElementById('talkStatus').innerText = 'Idle';
+    if (res.ok) logMsg('Talk clip sent', 'ok'); else logMsg('Talk send failed: HTTP ' + res.status, 'err');
+  } catch (e) {
+    document.getElementById('talkStatus').innerText = 'Idle';
+    logMsg('Talk send error: ' + e.message, 'err');
+  }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+function mergeFloat32(chunks) {
+  let len = 0;
+  chunks.forEach((c) => { len += c.length; });
+  const out = new Float32Array(len);
+  let offset = 0;
+  chunks.forEach((c) => { out.set(c, offset); offset += c.length; });
+  return out;
+}
+
+function downsampleTo16kMono(float32, srcRate) {
+  return downsampleToRate(float32, srcRate, 16000);
+}
+
+function downsampleToRate(float32, srcRate, dstRate) {
+  if (srcRate === dstRate) return floatTo16BitPCM(float32);
+  const ratio = srcRate / dstRate;
+  const newLen = Math.round(float32.length / ratio);
+  const result = new Float32Array(newLen);
+  let offsetResult = 0, offsetBuffer = 0;
+  while (offsetResult < newLen) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let accum = 0, count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32.length; i++) { accum += float32[i]; count++; }
+    result[offsetResult] = count > 0 ? accum / count : 0;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return floatTo16BitPCM(result);
+}
+
+/** 8kHz/8-bit mono WAV, small enough to embed as base64 text in an ntfy relay command message. */
+function buildCompactWavForRelay(float32, srcRate) {
+  const pcm16at8k = downsampleToRate(float32, srcRate, 8000);
+  const pcm8bit = new Uint8Array(pcm16at8k.length);
+  for (let i = 0; i < pcm16at8k.length; i++) {
+    pcm8bit[i] = ((pcm16at8k[i] >> 8) + 128) & 0xFF;
+  }
+  return encodeWav8(pcm8bit, 8000);
+}
+
+function encodeWav8(pcm8, sampleRate) {
+  const buffer = new ArrayBuffer(44 + pcm8.length);
+  const view = new DataView(buffer);
+  function writeStr(offset, str) { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); }
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + pcm8.length, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate, true);
+  view.setUint16(32, 1, true);
+  view.setUint16(34, 8, true);
+  writeStr(36, 'data');
+  view.setUint32(40, pcm8.length, true);
+  new Uint8Array(buffer, 44).set(pcm8);
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function floatTo16BitPCM(float32) {
+  const out = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    let s = Math.max(-1, Math.min(1, float32[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return out;
+}
+
+function encodeWav(pcm16, sampleRate) {
+  const buffer = new ArrayBuffer(44 + pcm16.length * 2);
+  const view = new DataView(buffer);
+  function writeStr(offset, str) { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); }
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + pcm16.length * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, pcm16.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < pcm16.length; i++, offset += 2) { view.setInt16(offset, pcm16[i], true); }
+  return new Blob([buffer], { type: 'audio/wav' });
 }
 
 async function sendAction(action) {

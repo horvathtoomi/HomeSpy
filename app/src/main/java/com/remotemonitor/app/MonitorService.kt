@@ -15,6 +15,7 @@ import android.os.BatteryManager
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Base64
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -45,6 +46,10 @@ class MonitorService : Service(), ConnectChecker {
         private const val NOTIF_WAKE_ID = 1002
         private const val WATCHDOG_REQUEST_CODE = 997
         private const val WATCHDOG_INTERVAL_MS = 60_000L
+        private const val HEALTH_CHECK_INTERVAL_MS = 30_000L
+        private const val THERMAL_LIMIT_C = 46.0
+        private const val CRITICAL_BATTERY_PERCENT = 8
+        private const val DOWNGRADED_BITRATE_BPS = 400 * 1024
         const val ACTION_APPLY = "com.remotemonitor.app.APPLY"
         const val ACTION_RELOAD_CONFIG = "com.remotemonitor.app.RELOAD_CONFIG"
         const val ACTION_RESTART_SELF = "com.remotemonitor.app.RESTART_SELF"
@@ -81,6 +86,11 @@ class MonitorService : Service(), ConnectChecker {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mutex = Mutex()
     private var watchdogJob: Job? = null
+    private var healthJob: Job? = null
+    @Volatile private var thermalProtectionTripped = false
+    @Volatile private var lastStreamWasDirectTarget = true
+    private val talkPlayer = TalkAudioPlayer()
+    private val recordingManager by lazy { RecordingManager(this) }
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var screenWakeLock: PowerManager.WakeLock? = null
@@ -141,7 +151,7 @@ class MonitorService : Service(), ConnectChecker {
         mqttWatcher = MqttWatcher(this) { payload -> applyPayload(payload) }
         mqttWatcher?.start()
 
-        directWebStreamer = DirectWebStreamer(this, sseClient, ntfyWatcher)
+        directWebStreamer = DirectWebStreamer(this, sseClient, ntfyWatcher, mqttWatcher)
 
         updateNotification("IDLE")
     }
@@ -201,9 +211,8 @@ class MonitorService : Service(), ConnectChecker {
     }
 
     suspend fun applyPayloadSync(payload: ControlPayload) {
-        if (!AppConfig.tokenMatches(this, payload.authToken)) {
-            MonitorBus.failedAuthCount++
-            Log.w(TAG, "Rejected payload: invalid auth token (count=${MonitorBus.failedAuthCount})")
+        if (!AppConfig.checkAuth(this, payload.authToken)) {
+            Log.w(TAG, "Rejected payload: invalid auth token or cooldown active (count=${MonitorBus.failedAuthCount})")
             return
         }
         withContext(Dispatchers.Main.immediate) {
@@ -215,6 +224,12 @@ class MonitorService : Service(), ConnectChecker {
                     "SWITCH_CAMERA" -> handleSwitchCamera()
                     "TORCH_ON" -> handleTorch(true)
                     "TORCH_OFF" -> handleTorch(false)
+                    "SENTINEL" -> handleStart(payload.copy(streamTarget = ""))
+                    "SET_ZOOM" -> handleSetZoom(payload.zoomLevel)
+                    "AUTOFOCUS" -> handleAutofocus()
+                    "TALK" -> handleTalk(payload.talkWavB64)
+                    "RECORD_START" -> handleRecordStart()
+                    "RECORD_STOP" -> handleRecordStop()
                     else -> MonitorBus.lastError = "Unknown action: ${payload.action}"
                 }
             }
@@ -289,6 +304,102 @@ class MonitorService : Service(), ConnectChecker {
         }
     }
 
+    private fun handleSetZoom(level: Float) {
+        if (MonitorBus.state != MonitorState.STREAMING) {
+            MonitorBus.lastError = "Cannot set zoom: not streaming"
+            return
+        }
+        val streamer = activeStreamer() ?: run {
+            MonitorBus.lastError = "No active streamer"
+            return
+        }
+        try {
+            val range = streamer.zoomRange
+            val clamped = level.coerceIn(range.lower, range.upper)
+            streamer.setZoom(clamped)
+            MonitorBus.zoomLevel = clamped
+            Log.i(TAG, "Zoom set to $clamped")
+            publishStatusReply()
+        } catch (e: Exception) {
+            Log.e(TAG, "setZoom error", e)
+            MonitorBus.lastError = "setZoom error: ${e.message}"
+        }
+    }
+
+    private fun handleAutofocus() {
+        if (MonitorBus.state != MonitorState.STREAMING) {
+            MonitorBus.lastError = "Cannot autofocus: not streaming"
+            return
+        }
+        val streamer = activeStreamer() ?: run {
+            MonitorBus.lastError = "No active streamer"
+            return
+        }
+        try {
+            streamer.enableAutoFocus()
+            Log.i(TAG, "Autofocus triggered")
+            publishStatusReply()
+        } catch (e: Exception) {
+            Log.e(TAG, "autofocus error", e)
+            MonitorBus.lastError = "autofocus error: ${e.message}"
+        }
+    }
+
+    /** Plays a short PCM16 WAV/raw clip through the speaker — two-way audio / push-to-talk. Works regardless of streaming state. */
+    private fun handleTalk(wavB64: String) {
+        if (wavB64.isBlank()) {
+            MonitorBus.lastError = "TALK: no audio payload"
+            return
+        }
+        try {
+            val bytes = Base64.decode(wavB64, Base64.DEFAULT)
+            playTalkAudio(bytes)
+        } catch (e: Exception) {
+            Log.e(TAG, "TALK decode error", e)
+            MonitorBus.lastError = "TALK decode error: ${e.message}"
+        }
+    }
+
+    /** Entry point also used directly by ControlApiServer's /api/talk (raw bytes, no base64 involved). */
+    fun playTalkAudio(bytes: ByteArray) {
+        talkPlayer.play(bytes)
+    }
+
+    private fun handleRecordStart() {
+        if (MonitorBus.state != MonitorState.STREAMING) {
+            MonitorBus.lastError = "Cannot start recording: not streaming"
+            return
+        }
+        val streamer = activeStreamer() ?: run {
+            MonitorBus.lastError = "RECORD_START: no active camera/video session (direct audio-only mode has nothing to record)"
+            return
+        }
+        if (streamer.isRecording) return
+        try {
+            val file = recordingManager.newRecordingFile()
+            streamer.startRecord(file.absolutePath)
+            MonitorBus.recordingActive = true
+            MonitorBus.recordingFile = file.name
+            Log.i(TAG, "Local recording started: ${file.name}")
+            publishStatusReply()
+        } catch (e: Exception) {
+            Log.e(TAG, "RECORD_START error", e)
+            MonitorBus.lastError = "RECORD_START error: ${e.message}"
+        }
+    }
+
+    private fun handleRecordStop() {
+        val streamer = activeStreamer()
+        try {
+            if (streamer?.isRecording == true) streamer.stopRecord()
+        } catch (e: Exception) {
+            Log.w(TAG, "stopRecord error: ${e.message}")
+        }
+        MonitorBus.recordingActive = false
+        MonitorBus.recordingFile = ""
+        publishStatusReply()
+    }
+
     private suspend fun handleStart(payload: ControlPayload) {
         if (MonitorBus.state == MonitorState.STREAMING || MonitorBus.state == MonitorState.STARTING) {
             Log.i(TAG, "Restarting stream with new parameters")
@@ -336,12 +447,14 @@ class MonitorService : Service(), ConnectChecker {
                     }
                 }
                 scheduleWatchdog(payload.durationSeconds)
+                scheduleHealthMonitor()
                 Log.i(TAG, "Streaming started: mode=${payload.mode} target=${MonitorBus.streamUrl} bitrate=${payload.videoBitrateKbps}k fps=${payload.fps}")
                 try {
-                    directWebStreamer?.start(activeStreamer(), payload)
+                    directWebStreamer?.start(activeStreamer(), payload, lastStreamWasDirectTarget)
                 } catch (e: Exception) {
                     Log.w(TAG, "DirectWebStreamer start failed: ${e.message}")
                 }
+                if (payload.recordLocally) handleRecordStart()
                 publishStatusReply()
             } else {
                 MonitorBus.lastError = "Failed to prepare/start stream"
@@ -360,12 +473,21 @@ class MonitorService : Service(), ConnectChecker {
         MonitorBus.update(MonitorState.STOPPING)
         watchdogJob?.cancel()
         watchdogJob = null
+        healthJob?.cancel()
+        healthJob = null
+        thermalProtectionTripped = false
+        try {
+            if (MonitorBus.recordingActive) activeStreamer()?.let { if (it.isRecording) it.stopRecord() }
+        } catch (_: Exception) {}
+        MonitorBus.recordingActive = false
+        MonitorBus.recordingFile = ""
         try {
             if (MonitorBus.torchActive) {
                 activeStreamer()?.disableLantern()
             }
         } catch (_: Exception) {}
         MonitorBus.torchActive = false
+        MonitorBus.zoomLevel = 1.0f
         cleanupStreamers()
         releaseScreenWakeLock()
         getSystemService(NotificationManager::class.java).cancel(NOTIF_WAKE_ID)
@@ -377,6 +499,75 @@ class MonitorService : Service(), ConnectChecker {
         MonitorBus.update(MonitorState.IDLE)
         Log.i(TAG, "Stopped: $reason")
         publishStatusReply()
+    }
+
+    /** Periodic thermal/battery self-protection while STREAMING: downgrade bitrate on first trip, stop the stream if it's still tripped on the next check. */
+    private fun scheduleHealthMonitor() {
+        healthJob?.cancel()
+        thermalProtectionTripped = false
+        healthJob = scope.launch {
+            while (isActive) {
+                delay(HEALTH_CHECK_INTERVAL_MS)
+                mutex.withLock { checkThermalBattery() }
+            }
+        }
+    }
+
+    private suspend fun checkThermalBattery() {
+        if (MonitorBus.state != MonitorState.STREAMING) return
+        val tempC = readTemperatureC()
+        MonitorBus.temperatureC = tempC
+        val battery = batteryPercent()
+        val charging = isCharging()
+        val overheating = tempC >= THERMAL_LIMIT_C
+        val criticalBattery = !charging && battery <= CRITICAL_BATTERY_PERCENT
+        if (!overheating && !criticalBattery) return
+
+        val reason = if (overheating) "thermal (${tempC}C)" else "critical battery (${battery}%)"
+        MonitorBus.lastError = "Self-protection: $reason"
+        publishRelayAlert("critical", JSONObject().apply {
+            put("message", reason)
+            put("temperature_c", tempC)
+            put("battery_percent", battery)
+        })
+
+        if (!thermalProtectionTripped) {
+            thermalProtectionTripped = true
+            try {
+                activeStreamer()?.setVideoBitrateOnFly(DOWNGRADED_BITRATE_BPS)
+                Log.w(TAG, "Self-protection: downgraded bitrate due to $reason")
+            } catch (e: Exception) {
+                Log.w(TAG, "Self-protection: bitrate downgrade failed: ${e.message}")
+            }
+        } else {
+            Log.w(TAG, "Self-protection: stopping stream, $reason persisted past the downgrade")
+            handleStop("self-protection: $reason")
+        }
+    }
+
+    private fun publishRelayAlert(reason: String, extra: JSONObject) {
+        try {
+            val json = JSONObject().apply {
+                put("type", "alert")
+                put("reason", reason)
+                put("timestamp_ms", System.currentTimeMillis())
+                val keyIt = extra.keys()
+                while (keyIt.hasNext()) {
+                    val k = keyIt.next()
+                    put(k, extra.get(k))
+                }
+            }.toString()
+            ntfyWatcher?.publishStatus(json)
+            mqttWatcher?.publishStatus(json)
+        } catch (e: Exception) {
+            Log.w(TAG, "publishRelayAlert error: ${e.message}")
+        }
+    }
+
+    private fun readTemperatureC(): Double {
+        val i = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return 0.0
+        val tenths = i.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0)
+        return tenths / 10.0
     }
 
     fun publishStatusReply() {
@@ -410,6 +601,7 @@ class MonitorService : Service(), ConnectChecker {
         val isDirect = rawTarget.isEmpty() || rawTarget.equals("DIRECT", ignoreCase = true)
         val target = if (isDirect) "" else rawTarget
         val useServer = isDirect
+        lastStreamWasDirectTarget = isDirect
 
         if (isDirect && isAudioOnly) {
             // Direct + AUDIO_ONLY needs no RootEncoder instance at all: there is no video to
@@ -553,6 +745,10 @@ class MonitorService : Service(), ConnectChecker {
         put("torch_active", MonitorBus.torchActive)
         put("video_bitrate_kbps", MonitorBus.activePayload?.videoBitrateKbps ?: 1500)
         put("fps", MonitorBus.activePayload?.fps ?: 30)
+        put("temperature_c", readTemperatureC().also { MonitorBus.temperatureC = it })
+        put("is_recording", MonitorBus.recordingActive)
+        put("recording_file", MonitorBus.recordingFile)
+        put("zoom_level", MonitorBus.zoomLevel)
         put("overlay_allowed", Settings.canDrawOverlays(this@MonitorService))
         put("ntfy_topic_configured", AppConfig.ntfyTopic(this@MonitorService).isNotBlank())
         put("mqtt_configured", AppConfig.mqttUrl(this@MonitorService).isNotBlank())
@@ -771,6 +967,7 @@ class MonitorService : Service(), ConnectChecker {
 
     override fun onDestroy() {
         watchdogJob?.cancel()
+        healthJob?.cancel()
         cleanupStreamers()
         releaseStandbyLocks()
         releaseScreenWakeLock()

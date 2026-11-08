@@ -5,11 +5,14 @@ import android.util.Log
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 
 class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0", port) {
     companion object { private const val TAG = "RM-API" }
+
+    private val recordingManager by lazy { RecordingManager(ctx) }
 
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri ?: ""
@@ -28,6 +31,10 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
                 method == Method.GET && uri == "/api/audio.wav" -> handleAudio(session)
                 method == Method.GET && uri == "/api/mjpeg" -> handleMjpeg(session)
                 method == Method.GET && uri == "/api/live_pack" -> handleLivePack(session)
+                method == Method.POST && uri == "/api/talk" -> handleTalk(session)
+                method == Method.GET && uri == "/api/recordings" -> handleRecordingsList(session)
+                method == Method.GET && uri.startsWith("/api/recordings/") -> handleRecordingDownload(session, uri.removePrefix("/api/recordings/"))
+                method == Method.DELETE && uri.startsWith("/api/recordings/") -> handleRecordingDelete(session, uri.removePrefix("/api/recordings/"))
                 method == Method.GET && uri == "/health" -> newFixedLengthResponse(Response.Status.OK, "application/json", """{"ok":true}""")
                 else -> json(Response.Status.NOT_FOUND, """{"ok":false,"error":"not found"}""")
             }
@@ -47,9 +54,8 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
         val body = files["postData"] ?: ""
         val payload = ControlPayload.parse(body)
             ?: return json(Response.Status.BAD_REQUEST, """{"ok":false,"error":"invalid json"}""")
-        if (!AppConfig.tokenMatches(ctx, payload.authToken)) {
-            MonitorBus.failedAuthCount++
-            Log.w(TAG, "401 invalid token on /api/control")
+        if (!AppConfig.checkAuth(ctx, payload.authToken)) {
+            Log.w(TAG, "401 invalid token (or cooldown active) on /api/control")
             return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
         }
         val svc = MonitorService.instance
@@ -69,7 +75,6 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
 
     private fun handleStatus(session: IHTTPSession): Response {
         if (!isAuthorized(session)) {
-            MonitorBus.failedAuthCount++
             return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
         }
         val svc = MonitorService.instance
@@ -80,7 +85,6 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
     /** Latest JPEG snapshot pulled from the live camera session (no external RTSP player needed). */
     private fun handleSnapshot(session: IHTTPSession): Response {
         if (!isAuthorized(session)) {
-            MonitorBus.failedAuthCount++
             return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
         }
         val jpeg = MonitorService.instance?.webStreamer?.snapshotBytes()
@@ -95,7 +99,6 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
     /** Continuous raw-PCM-as-WAV stream of the mic, playable directly in a browser <audio> tag. */
     private fun handleAudio(session: IHTTPSession): Response {
         if (!isAuthorized(session)) {
-            MonitorBus.failedAuthCount++
             return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
         }
         val streamer = MonitorService.instance?.webStreamer
@@ -109,7 +112,6 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
     /** multipart/x-mixed-replace MJPEG stream for clients that want continuous video instead of polled snapshots. */
     private fun handleMjpeg(session: IHTTPSession): Response {
         if (!isAuthorized(session)) {
-            MonitorBus.failedAuthCount++
             return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
         }
         val streamer = MonitorService.instance?.webStreamer
@@ -123,7 +125,6 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
     /** Single-request JSON pack (snapshot + recent audio, both base64) for NAT-relay polling. */
     private fun handleLivePack(session: IHTTPSession): Response {
         if (!isAuthorized(session)) {
-            MonitorBus.failedAuthCount++
             return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
         }
         val streamer = MonitorService.instance?.webStreamer
@@ -132,10 +133,74 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
     }
 
     private fun isAuthorized(session: IHTTPSession): Boolean {
+        if (MonitorBus.isAuthCooldownActive()) return false
         val auth = session.headers["authorization"] ?: session.headers["Authorization"] ?: ""
         val token = auth.removePrefix("Bearer ").removePrefix("bearer ").trim()
         val qpToken = session.parameters["auth_token"]?.firstOrNull()
-        return AppConfig.tokenMatches(ctx, token) || AppConfig.tokenMatches(ctx, qpToken)
+        // Try the header token first, then the query-param fallback, without double-counting a
+        // failure for the same request when the first form is simply absent (blank).
+        if (token.isNotBlank() && AppConfig.checkAuth(ctx, token)) return true
+        if (qpToken != null && AppConfig.checkAuth(ctx, qpToken)) return true
+        if (token.isBlank() && qpToken == null) MonitorBus.recordAuthFailure()
+        return false
+    }
+
+    /** POST raw WAV/PCM bytes, played immediately through the speaker. */
+    private fun handleTalk(session: IHTTPSession): Response {
+        if (!isAuthorized(session)) {
+            return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
+        }
+        val svc = MonitorService.instance
+            ?: return json(Response.Status.SERVICE_UNAVAILABLE, """{"ok":false,"error":"service not running"}""")
+        val len = (session.headers["content-length"] ?: session.headers["Content-Length"])?.toIntOrNull() ?: 0
+        if (len <= 0 || len > 5_000_000) {
+            return json(Response.Status.BAD_REQUEST, """{"ok":false,"error":"invalid or oversized content length"}""")
+        }
+        val buf = ByteArray(len)
+        var read = 0
+        val input = session.inputStream
+        while (read < len) {
+            val n = input.read(buf, read, len - read)
+            if (n <= 0) break
+            read += n
+        }
+        svc.playTalkAudio(if (read == len) buf else buf.copyOf(read))
+        return json(Response.Status.OK, """{"ok":true}""")
+    }
+
+    private fun handleRecordingsList(session: IHTTPSession): Response {
+        if (!isAuthorized(session)) {
+            return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
+        }
+        val arr = JSONArray()
+        recordingManager.listFiles().forEach { f ->
+            arr.put(JSONObject().apply {
+                put("name", f.name)
+                put("size_bytes", f.length())
+                put("modified_ms", f.lastModified())
+            })
+        }
+        return json(Response.Status.OK, JSONObject().apply { put("ok", true); put("files", arr) }.toString())
+    }
+
+    private fun handleRecordingDownload(session: IHTTPSession, filename: String): Response {
+        if (!isAuthorized(session)) {
+            return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
+        }
+        val f = recordingManager.safeFile(filename)
+            ?: return json(Response.Status.NOT_FOUND, """{"ok":false,"error":"not found"}""")
+        val resp = newFixedLengthResponse(Response.Status.OK, "video/mp4", f.inputStream(), f.length())
+        resp.addHeader("Content-Disposition", "attachment; filename=\"${f.name}\"")
+        resp.addHeader("Cache-Control", "no-store")
+        return resp
+    }
+
+    private fun handleRecordingDelete(session: IHTTPSession, filename: String): Response {
+        if (!isAuthorized(session)) {
+            return json(Response.Status.UNAUTHORIZED, """{"ok":false,"error":"unauthorized"}""")
+        }
+        val ok = recordingManager.delete(filename)
+        return json(if (ok) Response.Status.OK else Response.Status.NOT_FOUND, """{"ok":$ok}""")
     }
 
     private fun json(status: Response.Status, body: String): Response =

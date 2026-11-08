@@ -56,6 +56,18 @@ object AppConfig {
         if (provided == configured) return true
         return provided.equals(sha256(configured), ignoreCase = true)
     }
+
+    /**
+     * Single gate for every authenticated endpoint (HTTP and relay). Rejects outright, without
+     * even checking the token, while a brute-force cooldown is active; otherwise checks the
+     * token and records the outcome so repeated failures accumulate toward the next cooldown.
+     */
+    fun checkAuth(ctx: Context, provided: String?): Boolean {
+        if (MonitorBus.isAuthCooldownActive()) return false
+        val ok = tokenMatches(ctx, provided)
+        if (ok) MonitorBus.recordAuthSuccess() else MonitorBus.recordAuthFailure()
+        return ok
+    }
 }
 
 enum class MonitorState { IDLE, STARTING, STREAMING, STOPPING }
@@ -73,7 +85,16 @@ data class ControlPayload(
     val fps: Int = 30,
     val callbackUrl: String = "",
     val ntfyPushSnapshots: Boolean = false,
-    val snapshotIntervalMs: Long = 1000
+    val snapshotIntervalMs: Long = 1000,
+    // Issue #1: when stream_target is a remote RTSP/RTMP push, DirectWebStreamer's own
+    // AudioRecord is skipped by default (RootEncoder's own prepareAudio() already owns the
+    // mic for that path) unless the caller explicitly opts into local web/ntfy audio too.
+    val webAudioEnabled: Boolean = false,
+    val recordLocally: Boolean = false,
+    val voxThresholdDb: Int = 0,
+    val motionSensitivity: Int = 0,
+    val zoomLevel: Float = 1.0f,
+    val talkWavB64: String = ""
 ) {
     companion object {
         fun fromJson(obj: JSONObject): ControlPayload {
@@ -103,7 +124,13 @@ data class ControlPayload(
                 fps = fpsClamped,
                 callbackUrl = obj.optString("callback_url", ""),
                 ntfyPushSnapshots = obj.optBoolean("ntfy_push_snapshots", false),
-                snapshotIntervalMs = snapshotIntervalClamped
+                snapshotIntervalMs = snapshotIntervalClamped,
+                webAudioEnabled = obj.optBoolean("web_audio_enabled", false),
+                recordLocally = obj.optBoolean("record_locally", false),
+                voxThresholdDb = obj.optInt("vox_threshold_db", 0),
+                motionSensitivity = obj.optInt("motion_sensitivity", 0).coerceIn(0, 100),
+                zoomLevel = obj.optDouble("zoom_level", 1.0).toFloat(),
+                talkWavB64 = obj.optString("talk_wav_b64", "")
             )
         }
 
@@ -128,7 +155,13 @@ object MonitorBus {
     @Volatile var lastError: String = ""
     @Volatile var streamUrl: String = ""
     @Volatile var failedAuthCount: Int = 0
+    @Volatile var consecutiveAuthFailures: Int = 0
+    @Volatile var authCooldownUntilMs: Long = 0L
     @Volatile var torchActive: Boolean = false
+    @Volatile var temperatureC: Double = 0.0
+    @Volatile var recordingActive: Boolean = false
+    @Volatile var recordingFile: String = ""
+    @Volatile var zoomLevel: Float = 1.0f
     // Tracks MainActivity's actual onResume()/onPause() lifecycle, so a service-triggered
     // stealth wake can wait for the activity to genuinely be in the foreground (not just
     // "startActivity() was called") before opening the camera on a cold wake from deep sleep.
@@ -148,6 +181,10 @@ object MonitorBus {
         put("torch_active", torchActive)
         put("video_bitrate_kbps", activePayload?.videoBitrateKbps ?: 1500)
         put("fps", activePayload?.fps ?: 30)
+        put("temperature_c", temperatureC)
+        put("is_recording", recordingActive)
+        put("recording_file", recordingFile)
+        put("zoom_level", zoomLevel)
     }
 
     fun remainingSeconds(): Long {
@@ -158,5 +195,26 @@ object MonitorBus {
     fun update(newState: MonitorState) {
         state = newState
         onStateChanged?.invoke(newState)
+    }
+
+    fun isAuthCooldownActive(): Boolean = System.currentTimeMillis() < authCooldownUntilMs
+
+    /**
+     * Exponential cooldown after repeated auth failures: 30s, 60s, 120s... capped at 10
+     * minutes. Resets the moment a valid token is presented.
+     */
+    fun recordAuthFailure() {
+        failedAuthCount++
+        consecutiveAuthFailures++
+        if (consecutiveAuthFailures > 5) {
+            val doublings = (consecutiveAuthFailures - 6).coerceIn(0, 6)
+            val cooldownMs = 30_000L * (1L shl doublings)
+            authCooldownUntilMs = System.currentTimeMillis() + cooldownMs.coerceAtMost(10 * 60_000L)
+        }
+    }
+
+    fun recordAuthSuccess() {
+        consecutiveAuthFailures = 0
+        authCooldownUntilMs = 0L
     }
 }
