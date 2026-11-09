@@ -25,9 +25,9 @@ adb forward tcp:8554 tcp:8554
 Start-Sleep -Seconds 3
 
 Write-Host "[5/5] Testing REST API Control (15s BOTH stream test)..." -ForegroundColor Yellow
-$postRes = curl.exe -s -X POST http://127.0.0.1:5000/api/control -H "Content-Type: application/json" -d '{"auth_token":"changeme-secret-token","action":"START","mode":"BOTH","duration_seconds":15}'
+$postRes = curl.exe -s -X POST http://127.0.0.1:5000/api/control -H "Content-Type: application/json" -d '{"action":"START","mode":"BOTH","duration_seconds":15}'
 Write-Host "API POST Response: $postRes" -ForegroundColor Green
 
-$statusRes = curl.exe -s -H "Authorization: Bearer changeme-secret-token" http://127.0.0.1:5000/api/status
+$statusRes = curl.exe -s http://127.0.0.1:5000/api/status
 Write-Host "API Status Response: $statusRes" -ForegroundColor Green
 Write-Host "=======================================================" -ForegroundColor Cyan

@@ -31,10 +31,10 @@ echo Waiting 3 seconds for service initialization...
 timeout /t 3 /nobreak >nul
 
 echo [5/5] Testing REST API Control (15s BOTH stream test)...
-curl -s -X POST http://127.0.0.1:5000/api/control -H "Content-Type: application/json" -d "{\"auth_token\":\"changeme-secret-token\",\"action\":\"START\",\"mode\":\"BOTH\",\"duration_seconds\":15}"
+curl -s -X POST http://127.0.0.1:5000/api/control -H "Content-Type: application/json" -d "{\"action\":\"START\",\"mode\":\"BOTH\",\"duration_seconds\":15}"
 echo.
 echo Status query:
-curl -s -H "Authorization: Bearer changeme-secret-token" http://127.0.0.1:5000/api/status
+curl -s http://127.0.0.1:5000/api/status
 echo.
 echo =======================================================
 echo Deployment and Test command completed!

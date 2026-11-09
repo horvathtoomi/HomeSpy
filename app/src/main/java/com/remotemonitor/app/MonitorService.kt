@@ -735,6 +735,7 @@ class MonitorService : Service(), ConnectChecker {
         put("device_manufacturer", Build.MANUFACTURER)
         put("android_id_short", androidIdShort())
         put("ip", bestIp())
+        put("ntfy_topic", AppConfig.ntfyTopic(this@MonitorService))
     }
 
     private fun androidIdShort(): String = try {
@@ -767,6 +768,7 @@ class MonitorService : Service(), ConnectChecker {
         put("recording_file", MonitorBus.recordingFile)
         put("zoom_level", MonitorBus.zoomLevel)
         put("overlay_allowed", Settings.canDrawOverlays(this@MonitorService))
+        put("ntfy_topic", AppConfig.ntfyTopic(this@MonitorService))
         put("ntfy_topic_configured", AppConfig.ntfyTopic(this@MonitorService).isNotBlank())
         put("mqtt_configured", AppConfig.mqttUrl(this@MonitorService).isNotBlank())
         put("ips", JSONObject().apply {

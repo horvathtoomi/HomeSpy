@@ -77,14 +77,14 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
         val svc = MonitorService.instance
             ?: return json(Response.Status.SERVICE_UNAVAILABLE, """{"ok":false,"error":"service not running"}""")
         runBlocking {
-            withTimeoutOrNull(4000) { svc.applyPayloadSync(payload) }
+            // 6s rather than 4s: a cold camera wake from deep sleep (wakeScreenAndShowActivity +
+            // waiting for onResume) needs enough headroom to actually reach STREAMING before this
+            // call gives up on it, so the caller's immediate response already reflects the real
+            // post-start state instead of a stale STARTING that forces a follow-up poll.
+            withTimeoutOrNull(6000) { svc.applyPayloadSync(payload) }
         }
-        val accepted = JSONObject().apply {
-            put("ok", true)
+        val accepted = svc.statusJson().apply {
             put("accepted", payload.action)
-            put("state", MonitorBus.state.name)
-            put("torch_active", MonitorBus.torchActive)
-            put("camera", MonitorBus.activePayload?.camera ?: "")
         }
         return json(Response.Status.OK, accepted.toString())
     }
