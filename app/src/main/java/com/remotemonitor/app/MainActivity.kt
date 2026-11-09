@@ -27,7 +27,6 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var tvStatus: TextView
     private lateinit var tvDetails: TextView
-    private lateinit var etToken: EditText
     private lateinit var etNtfy: EditText
     private lateinit var etMqtt: EditText
     private lateinit var root: ScrollView
@@ -66,16 +65,14 @@ class MainActivity : AppCompatActivity() {
         root = findViewById(R.id.rootScroll)
         tvStatus = findViewById(R.id.tvStatus)
         tvDetails = findViewById(R.id.tvDetails)
-        etToken = findViewById(R.id.etToken)
         etNtfy = findViewById(R.id.etNtfy)
         etMqtt = findViewById(R.id.etMqtt)
 
-        etToken.setText(AppConfig.token(this))
         etNtfy.setText(AppConfig.ntfyTopic(this))
         etMqtt.setText(AppConfig.mqttUrl(this))
 
         findViewById<Button>(R.id.btnSave).setOnClickListener {
-            AppConfig.save(this, etToken.text.toString(), etNtfy.text.toString(), etMqtt.text.toString())
+            AppConfig.save(this, AppConfig.token(this), etNtfy.text.toString(), etMqtt.text.toString())
             restartService()
             reloadServiceConfig()
             refreshUi()

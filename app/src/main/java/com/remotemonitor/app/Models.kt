@@ -50,24 +50,11 @@ object AppConfig {
         return md.digest(input.toByteArray()).joinToString("") { "%02x".format(it) }
     }
 
-    fun tokenMatches(ctx: Context, provided: String?): Boolean {
-        if (provided.isNullOrBlank()) return false
-        val configured = token(ctx)
-        if (provided == configured) return true
-        return provided.equals(sha256(configured), ignoreCase = true)
-    }
+    /** Zero-auth build: anyone holding the controller HTML or on the network can connect with no token. */
+    fun tokenMatches(ctx: Context, provided: String?): Boolean = true
 
-    /**
-     * Single gate for every authenticated endpoint (HTTP and relay). Rejects outright, without
-     * even checking the token, while a brute-force cooldown is active; otherwise checks the
-     * token and records the outcome so repeated failures accumulate toward the next cooldown.
-     */
-    fun checkAuth(ctx: Context, provided: String?): Boolean {
-        if (MonitorBus.isAuthCooldownActive()) return false
-        val ok = tokenMatches(ctx, provided)
-        if (ok) MonitorBus.recordAuthSuccess() else MonitorBus.recordAuthFailure()
-        return ok
-    }
+    /** Zero-auth build: every endpoint and relay command is accepted unconditionally. */
+    fun checkAuth(ctx: Context, provided: String?): Boolean = true
 }
 
 enum class MonitorState { IDLE, STARTING, STREAMING, STOPPING }
@@ -154,9 +141,6 @@ object MonitorBus {
     @Volatile var endsAtMs: Long = 0L
     @Volatile var lastError: String = ""
     @Volatile var streamUrl: String = ""
-    @Volatile var failedAuthCount: Int = 0
-    @Volatile var consecutiveAuthFailures: Int = 0
-    @Volatile var authCooldownUntilMs: Long = 0L
     @Volatile var torchActive: Boolean = false
     @Volatile var temperatureC: Double = 0.0
     @Volatile var recordingActive: Boolean = false
@@ -177,7 +161,6 @@ object MonitorBus {
         put("ends_at_ms", endsAtMs)
         put("remaining_seconds", remainingSeconds())
         put("last_error", lastError)
-        put("failed_auth_count", failedAuthCount)
         put("torch_active", torchActive)
         put("video_bitrate_kbps", activePayload?.videoBitrateKbps ?: 1500)
         put("fps", activePayload?.fps ?: 30)
@@ -195,26 +178,5 @@ object MonitorBus {
     fun update(newState: MonitorState) {
         state = newState
         onStateChanged?.invoke(newState)
-    }
-
-    fun isAuthCooldownActive(): Boolean = System.currentTimeMillis() < authCooldownUntilMs
-
-    /**
-     * Exponential cooldown after repeated auth failures: 30s, 60s, 120s... capped at 10
-     * minutes. Resets the moment a valid token is presented.
-     */
-    fun recordAuthFailure() {
-        failedAuthCount++
-        consecutiveAuthFailures++
-        if (consecutiveAuthFailures > 5) {
-            val doublings = (consecutiveAuthFailures - 6).coerceIn(0, 6)
-            val cooldownMs = 30_000L * (1L shl doublings)
-            authCooldownUntilMs = System.currentTimeMillis() + cooldownMs.coerceAtMost(10 * 60_000L)
-        }
-    }
-
-    fun recordAuthSuccess() {
-        consecutiveAuthFailures = 0
-        authCooldownUntilMs = 0L
     }
 }

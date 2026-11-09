@@ -309,18 +309,6 @@ object DashboardHtml {
     </div>
   </header>
 
-  <!-- Authentication -->
-  <div class="card">
-    <div class="card-header">
-      <span class="card-label">Authentication</span>
-      <span style="font-size:0.7rem; color:var(--text-muted);">Stored locally in browser</span>
-    </div>
-    <div class="form-item">
-      <label class="form-label" for="tokenInput">Bearer Auth Token</label>
-      <input type="password" id="tokenInput" placeholder="Enter auth token..." autocomplete="off">
-    </div>
-  </div>
-
   <!-- Telemetry -->
   <div class="card">
     <div class="card-header">
@@ -519,12 +507,6 @@ object DashboardHtml {
 
 <script>
   let lastTorchActive = false;
-  const tokenInput = document.getElementById('tokenInput');
-  const savedToken = localStorage.getItem('rm_auth_token') || 'changeme-secret-token';
-  tokenInput.value = savedToken;
-  tokenInput.addEventListener('input', () => {
-    localStorage.setItem('rm_auth_token', tokenInput.value);
-  });
 
   function logMsg(msg, type = 'info') {
     const el = document.getElementById('consoleLog');
@@ -535,18 +517,8 @@ object DashboardHtml {
   }
 
   async function fetchStatus() {
-    const token = tokenInput.value.trim();
-    if (!token) return;
     try {
-      const res = await fetch('/api/status', {
-        headers: { 'Authorization': 'Bearer ' + token }
-      });
-      if (res.status === 401) {
-        document.getElementById('badgeText').innerText = 'UNAUTHORIZED';
-        document.getElementById('statusBadge').className = 'status-badge';
-        logMsg('Authentication rejected: invalid token', 'err');
-        return;
-      }
+      const res = await fetch('/api/status');
       if (!res.ok) {
         logMsg('Telemetry query returned HTTP ' + res.status, 'err');
         return;
@@ -638,9 +610,8 @@ object DashboardHtml {
     if (liveMonitorActive) return;
     liveMonitorActive = true;
     document.getElementById('liveMonitorCard').style.display = 'flex';
-    const token = tokenInput.value.trim();
     const audio = document.getElementById('liveAudio');
-    audio.src = '/api/audio.wav?auth_token=' + encodeURIComponent(token) + '&t=' + Date.now();
+    audio.src = '/api/audio.wav?t=' + Date.now();
     audio.muted = audioMuted;
     audio.play().catch(() => { /* autoplay may need a user gesture on some browsers */ });
     snapshotFrameCount = 0;
@@ -664,8 +635,6 @@ object DashboardHtml {
 
   function loadSnapshot() {
     if (!liveMonitorActive) return;
-    const token = tokenInput.value.trim();
-    if (!token) return;
     const rate = parseInt(document.getElementById('selRefreshRate').value, 10) || 1000;
     const next = new Image();
     next.onload = () => {
@@ -678,7 +647,7 @@ object DashboardHtml {
     next.onerror = () => {
       if (liveMonitorActive) snapshotTimer = setTimeout(loadSnapshot, rate);
     };
-    next.src = '/api/snapshot.jpg?auth_token=' + encodeURIComponent(token) + '&t=' + Date.now();
+    next.src = '/api/snapshot.jpg?t=' + Date.now();
   }
 
   function toggleMute() {
@@ -709,13 +678,7 @@ object DashboardHtml {
   }
 
   async function sendAction(action) {
-    const token = tokenInput.value.trim();
-    if (!token) {
-      logMsg('Token field is empty', 'err');
-      return;
-    }
     const payload = {
-      auth_token: token,
       action: action,
       mode: document.getElementById('selMode').value,
       camera: document.getElementById('selCamera').value,
@@ -781,13 +744,11 @@ object DashboardHtml {
   }
 
   async function sendZoom(level) {
-    const token = tokenInput.value.trim();
-    if (!token) return;
     try {
       await fetch('/api/control', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ auth_token: token, action: 'SET_ZOOM', zoom_level: level })
+        body: JSON.stringify({ action: 'SET_ZOOM', zoom_level: level })
       });
     } catch (e) {
       logMsg('Zoom command failed: ' + e.message, 'err');
@@ -801,11 +762,9 @@ object DashboardHtml {
   }
 
   async function loadRecordings() {
-    const token = tokenInput.value.trim();
-    if (!token) return;
     const box = document.getElementById('recordingsList');
     try {
-      const res = await fetch('/api/recordings', { headers: { 'Authorization': 'Bearer ' + token } });
+      const res = await fetch('/api/recordings');
       if (!res.ok) { box.innerText = 'Failed to load (HTTP ' + res.status + ')'; return; }
       const data = await res.json();
       const files = data.files || [];
@@ -824,7 +783,7 @@ object DashboardHtml {
         const actions = document.createElement('span');
         const dl = document.createElement('a');
         dl.innerText = 'Download';
-        dl.href = '/api/recordings/' + encodeURIComponent(f.name) + '?auth_token=' + encodeURIComponent(token);
+        dl.href = '/api/recordings/' + encodeURIComponent(f.name);
         dl.style.marginRight = '10px';
         dl.style.color = '#93c5fd';
         const del = document.createElement('a');
@@ -844,13 +803,8 @@ object DashboardHtml {
   }
 
   async function deleteRecording(name) {
-    const token = tokenInput.value.trim();
-    if (!token) return;
     try {
-      await fetch('/api/recordings/' + encodeURIComponent(name), {
-        method: 'DELETE',
-        headers: { 'Authorization': 'Bearer ' + token }
-      });
+      await fetch('/api/recordings/' + encodeURIComponent(name), { method: 'DELETE' });
       logMsg('Deleted recording ' + name, 'ok');
       loadRecordings();
     } catch (e) {
@@ -902,10 +856,9 @@ object DashboardHtml {
       document.getElementById('talkStatus').innerText = 'Sending...';
       const pcm16 = downsampleTo16kMono(merged, srcRate);
       const wavBlob = encodeWav(pcm16, 16000);
-      const token = tokenInput.value.trim();
       const res = await fetch('/api/talk', {
         method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'audio/wav' },
+        headers: { 'Content-Type': 'audio/wav' },
         body: wavBlob
       });
       document.getElementById('talkStatus').innerText = 'Idle';
@@ -976,9 +929,43 @@ object DashboardHtml {
     return new Blob([buffer], { type: 'audio/wav' });
   }
 
+  // ---- URL query params for zero-touch launch (e.g. ?mode=BOTH&camera=BACK&res=720p&fps=30&bitrate=1500&autostart=1) ----
+  function applyQueryParamsToForm() {
+    const qp = new URLSearchParams(window.location.search);
+    const fieldMap = { mode: 'selMode', camera: 'selCamera', res: 'selRes', fps: 'numFps', bitrate: 'numBitrate', vox: 'numVox', motion: 'numMotion' };
+    Object.keys(fieldMap).forEach((key) => {
+      if (qp.has(key)) {
+        const el = document.getElementById(fieldMap[key]);
+        if (el) el.value = qp.get(key);
+      }
+    });
+  }
+
+  async function autoStartIfIdle() {
+    const qp = new URLSearchParams(window.location.search);
+    if (qp.get('autostart') === '0') {
+      logMsg('Autostart disabled via ?autostart=0', 'info');
+      return;
+    }
+    try {
+      const res = await fetch('/api/status');
+      if (!res.ok) return;
+      const data = await res.json();
+      updateUi(data);
+      if (data.state === 'IDLE') {
+        logMsg('Auto-starting stream (zero-touch launch)...', 'info');
+        sendAction('START');
+      }
+    } catch (e) {
+      logMsg('Auto-start status check failed: ' + e.message, 'err');
+    }
+  }
+
+  applyQueryParamsToForm();
   fetchStatus();
   setInterval(fetchStatus, 2000);
   loadRecordings();
+  autoStartIfIdle();
 </script>
 </body>
 </html>"""

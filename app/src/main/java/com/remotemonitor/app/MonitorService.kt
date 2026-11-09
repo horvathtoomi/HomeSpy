@@ -12,6 +12,7 @@ import android.content.IntentFilter
 import android.graphics.PixelFormat
 import android.net.wifi.WifiManager
 import android.os.BatteryManager
+import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
@@ -211,10 +212,6 @@ class MonitorService : Service(), ConnectChecker {
     }
 
     suspend fun applyPayloadSync(payload: ControlPayload) {
-        if (!AppConfig.checkAuth(this, payload.authToken)) {
-            Log.w(TAG, "Rejected payload: invalid auth token or cooldown active (count=${MonitorBus.failedAuthCount})")
-            return
-        }
         withContext(Dispatchers.Main.immediate) {
             mutex.withLock {
                 when (payload.action) {
@@ -621,8 +618,8 @@ class MonitorService : Service(), ConnectChecker {
         return if (useServer) {
             val server = RtspServerCamera2(this, this, 8554)
             rtspServer = server
-            val token = AppConfig.token(this)
-            server.getStreamClient().setAuthorization("admin", token)
+            // Zero-auth build: no setAuthorization() call, so rtsp://<ip>:8554/live opens
+            // directly without a username/password prompt.
 
             // Deliberately never call server.prepareAudio() here: this RootEncoder instance is
             // only a secondary local RTSP viewer for this mode, and the mic must be free for
@@ -728,9 +725,30 @@ class MonitorService : Service(), ConnectChecker {
         rtmpClient = null
     }
 
+    /**
+     * Device identification metadata for network scanners (the controller's LAN fleet scan, or
+     * the phone's own /api/lan_scan of its sibling devices) to tell discovered phones apart.
+     */
+    fun deviceIdentityJson(): JSONObject = JSONObject().apply {
+        put("app", "RemoteMonitor")
+        put("device_model", Build.MODEL)
+        put("device_manufacturer", Build.MANUFACTURER)
+        put("android_id_short", androidIdShort())
+        put("ip", bestIp())
+    }
+
+    private fun androidIdShort(): String = try {
+        Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)?.takeLast(6) ?: ""
+    } catch (_: Exception) { "" }
+
     fun statusJson(): JSONObject = JSONObject().apply {
         val ips = allIps()
         put("ok", true)
+        put("app", "RemoteMonitor")
+        put("device_model", Build.MODEL)
+        put("device_manufacturer", Build.MANUFACTURER)
+        put("android_id_short", androidIdShort())
+        put("ip", bestIp(ips))
         put("state", MonitorBus.state.name)
         put("mode", MonitorBus.activePayload?.mode ?: "NONE")
         put("camera", MonitorBus.activePayload?.camera ?: "")
@@ -741,7 +759,6 @@ class MonitorService : Service(), ConnectChecker {
         put("started_at_ms", MonitorBus.startedAtMs)
         put("ends_at_ms", MonitorBus.endsAtMs)
         put("last_error", MonitorBus.lastError)
-        put("failed_auth_count", MonitorBus.failedAuthCount)
         put("torch_active", MonitorBus.torchActive)
         put("video_bitrate_kbps", MonitorBus.activePayload?.videoBitrateKbps ?: 1500)
         put("fps", MonitorBus.activePayload?.fps ?: 30)

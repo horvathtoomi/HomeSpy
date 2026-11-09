@@ -43,23 +43,6 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="Auth token"
-            android:textColor="#AAAAAA" />
-
-        <EditText
-            android:id="@+id/etToken"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:background="#222222"
-            android:inputType="textPassword"
-            android:padding="10dp"
-            android:textColor="#FFFFFF"
-            android:textColorHint="#666666" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
             android:text="Ntfy topic (secret)"
             android:textColor="#AAAAAA" />
 
@@ -141,7 +124,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="Control: POST /api/control on :5000 or ntfy topic. IDLE/STREAMING toggles dim automatically."
+            android:text="Control: POST /api/control on :5000 or ntfy topic. No authentication required. IDLE/STREAMING toggles dim automatically."
             android:textColor="#777777"
             android:textSize="12sp" />
     </LinearLayout>

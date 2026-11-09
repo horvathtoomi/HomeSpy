@@ -66,6 +66,14 @@
   .hidden { display: none !important; }
   .snapshot-box { background: #000; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; min-height: 160px; }
   .snapshot-box img { width: 100%; display: block; max-height: 480px; object-fit: contain; background: #000; }
+  .fleet-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .fleet-tile { background: var(--surface-elevated); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .fleet-tile img { width: 100%; height: 120px; object-fit: cover; background: #000; border-radius: 4px; display: block; }
+  .fleet-badge { font-size: 0.72rem; font-weight: 600; color: var(--text-primary); word-break: break-all; }
+  .fleet-telemetry { font-size: 0.68rem; color: var(--text-muted); }
+  .fleet-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+  .fleet-actions button { font-size: 0.68rem; padding: 4px 8px; }
+  .fleet-empty { font-size: 0.78rem; color: var(--text-muted); padding: 8px 0; }
 </style>
 </head>
 <body>
@@ -81,6 +89,34 @@
     </div>
   </header>
 
+  <!-- LAN Fleet Scanner & Multi-Device Wall -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-label">LAN Fleet Scanner & Multi-Device Wall</span>
+      <span id="fleetScanStatus" style="font-size:0.7rem; color:var(--text-muted);">Idle</span>
+    </div>
+    <div class="form-grid">
+      <div class="form-item">
+        <label class="form-label" for="fleetSubnets">Subnet prefix(es), comma-separated</label>
+        <input type="text" id="fleetSubnets" placeholder="192.168.1, 192.168.0, 10.0.0">
+      </div>
+      <div class="form-item">
+        <label class="form-label" for="fleetConcurrency">Concurrency (parallel probes)</label>
+        <input type="number" id="fleetConcurrency" value="25" min="5" max="100" step="5">
+      </div>
+      <div class="form-item" style="flex-direction:row; align-items:center; gap:8px;">
+        <input type="checkbox" id="chkAutoActivate" checked style="width:auto;">
+        <label class="form-label" for="chkAutoActivate" style="margin:0;">Auto-activate on discovery</label>
+      </div>
+    </div>
+    <div class="action-deck">
+      <button class="btn-start" onclick="scanAndActivateLan()">Scan Subnet</button>
+      <button onclick="activateAllDiscovered()">Activate All Discovered</button>
+      <button class="btn-stop" onclick="stopAllDiscovered()">Stop All Discovered</button>
+    </div>
+    <div id="fleetGrid" class="fleet-grid"><div class="fleet-empty">No devices discovered yet — click Scan Subnet.</div></div>
+  </div>
+
   <div class="card">
     <div class="card-header">
       <span class="card-label">Connection</span>
@@ -95,10 +131,6 @@
         <label class="form-label" for="baseUrl">Phone base URL</label>
         <input type="text" id="baseUrl" placeholder="http://192.168.1.50:5000 or http://100.x.x.x:5000">
       </div>
-      <div class="form-item">
-        <label class="form-label" for="tokenInput">Auth Token</label>
-        <input type="password" id="tokenInput" placeholder="changeme-secret-token" autocomplete="off">
-      </div>
     </div>
 
     <div id="ntfyFields" class="form-grid hidden">
@@ -106,12 +138,8 @@
         <label class="form-label" for="ntfyTopic">Ntfy topic</label>
         <input type="text" id="ntfyTopic" placeholder="rm-a40-xxxxxx">
       </div>
-      <div class="form-item">
-        <label class="form-label" for="tokenInputNtfy">Auth Token (sent inside each command's JSON)</label>
-        <input type="password" id="tokenInputNtfy" placeholder="changeme-secret-token" autocomplete="off">
-      </div>
     </div>
-    <div class="hint" id="modeHint">Direct mode talks straight to the phone's built-in HTTP server: live snapshot + continuous audio, lowest latency. Requires the phone to be reachable on your LAN, via Tailscale, or via a port-forward.</div>
+    <div class="hint" id="modeHint">Direct mode talks straight to the phone's built-in HTTP server: live snapshot + continuous audio, lowest latency. No authentication required — anyone with the base URL can connect. Requires the phone to be reachable on your LAN, via Tailscale, or via a port-forward.</div>
 
     <div class="action-deck">
       <button class="btn-start" onclick="connect()">Connect</button>
@@ -253,13 +281,11 @@ let eventSource = null;
 
 const els = {
   baseUrl: document.getElementById('baseUrl'),
-  token: document.getElementById('tokenInput'),
   ntfyTopic: document.getElementById('ntfyTopic'),
-  tokenNtfy: document.getElementById('tokenInputNtfy'),
 };
 
 // Persist connection fields locally so reopening this file doesn't require retyping.
-['baseUrl', 'tokenInput', 'ntfyTopic', 'tokenInputNtfy'].forEach(id => {
+['baseUrl', 'ntfyTopic'].forEach(id => {
   const el = document.getElementById(id);
   const saved = localStorage.getItem('rm_rc_' + id);
   if (saved) el.value = saved;
@@ -284,10 +310,6 @@ function switchMode(m) {
     ? 'Direct mode talks straight to the phone\'s built-in HTTP server: live snapshot + continuous audio, lowest latency. Requires the phone to be reachable on your LAN, via Tailscale, or via a port-forward.'
     : 'Ntfy relay mode needs no IP address and works from anywhere, even mobile data: commands and status/snapshot pushes travel through the public ntfy.sh broker. No continuous audio over this path — only periodic image pushes (enable "Push Snapshots" on the phone/dashboard for this topic).';
   loadRecordings();
-}
-
-function currentToken() {
-  return mode === 'direct' ? els.token.value.trim() : els.tokenNtfy.value.trim();
 }
 
 function setBadge(state) {
@@ -322,7 +344,7 @@ function connectDirect() {
   logMsg('Connecting directly to ' + base, 'info');
   document.getElementById('audioHint').innerText = '';
   const audio = document.getElementById('liveAudio');
-  audio.src = base + '/api/audio.wav?auth_token=' + encodeURIComponent(currentToken()) + '&t=' + Date.now();
+  audio.src = base + '/api/audio.wav?t=' + Date.now();
   audio.play().catch(() => {});
   pollStatusDirect();
   pollTimer = setInterval(pollStatusDirect, 2000);
@@ -332,10 +354,8 @@ function connectDirect() {
 
 async function pollStatusDirect() {
   const base = els.baseUrl.value.trim().replace(/\/$/, '');
-  const token = currentToken();
   try {
-    const res = await fetch(base + '/api/status', { headers: { 'Authorization': 'Bearer ' + token } });
-    if (res.status === 401) { setBadge('UNAUTHORIZED'); logMsg('Invalid token', 'err'); return; }
+    const res = await fetch(base + '/api/status');
     if (!res.ok) { logMsg('Status HTTP ' + res.status, 'err'); return; }
     const data = await res.json();
     applyStatus(data);
@@ -346,8 +366,7 @@ async function pollStatusDirect() {
 
 function loadSnapshotDirect() {
   const base = els.baseUrl.value.trim().replace(/\/$/, '');
-  const token = currentToken();
-  if (!base || !token) return;
+  if (!base) return;
   const img = new Image();
   img.onload = () => {
     document.getElementById('liveSnapshot').src = img.src;
@@ -355,7 +374,7 @@ function loadSnapshotDirect() {
     if (mode === 'direct') snapshotTimer = setTimeout(loadSnapshotDirect, 1000);
   };
   img.onerror = () => { if (mode === 'direct') snapshotTimer = setTimeout(loadSnapshotDirect, 1000); };
-  img.src = base + '/api/snapshot.jpg?auth_token=' + encodeURIComponent(token) + '&t=' + Date.now();
+  img.src = base + '/api/snapshot.jpg?t=' + Date.now();
 }
 
 // ---- Ntfy relay mode ----
@@ -482,7 +501,6 @@ function toggleTorch() {
 
 function buildPayload(action) {
   return {
-    auth_token: currentToken(),
     action: action,
     mode: document.getElementById('selMode').value,
     camera: document.getElementById('selCamera').value,
@@ -511,14 +529,14 @@ function onZoomInput(val) {
 }
 
 async function sendZoom(level) {
-  const payload = { auth_token: currentToken(), action: 'SET_ZOOM', zoom_level: level };
+  const payload = { action: 'SET_ZOOM', zoom_level: level };
   if (mode === 'ntfy') { await sendNtfyCommand(payload); return; }
   const base = els.baseUrl.value.trim().replace(/\/$/, '');
   if (!base) return;
   try {
     await fetch(`${base}/api/control`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + currentToken() },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
   } catch (e) {
@@ -536,10 +554,9 @@ async function loadRecordings() {
   const box = document.getElementById('recordingsList');
   if (mode !== 'direct') { box.innerText = 'Direct mode only. Switch to Direct IP / Tailscale to load recordings.'; return; }
   const base = els.baseUrl.value.trim().replace(/\/$/, '');
-  const token = currentToken();
-  if (!base || !token) { box.innerText = 'Connect first.'; return; }
+  if (!base) { box.innerText = 'Connect first.'; return; }
   try {
-    const res = await fetch(`${base}/api/recordings`, { headers: { 'Authorization': 'Bearer ' + token } });
+    const res = await fetch(`${base}/api/recordings`);
     if (!res.ok) { box.innerText = 'Failed to load (HTTP ' + res.status + ')'; return; }
     const data = await res.json();
     const files = data.files || [];
@@ -558,7 +575,7 @@ async function loadRecordings() {
       const actions = document.createElement('span');
       const dl = document.createElement('a');
       dl.innerText = 'Download';
-      dl.href = `${base}/api/recordings/${encodeURIComponent(f.name)}?auth_token=${encodeURIComponent(token)}`;
+      dl.href = `${base}/api/recordings/${encodeURIComponent(f.name)}`;
       dl.style.marginRight = '10px';
       dl.style.color = '#93c5fd';
       const del = document.createElement('a');
@@ -579,12 +596,8 @@ async function loadRecordings() {
 
 async function deleteRecording(name) {
   const base = els.baseUrl.value.trim().replace(/\/$/, '');
-  const token = currentToken();
   try {
-    await fetch(`${base}/api/recordings/${encodeURIComponent(name)}`, {
-      method: 'DELETE',
-      headers: { 'Authorization': 'Bearer ' + token }
-    });
+    await fetch(`${base}/api/recordings/${encodeURIComponent(name)}`, { method: 'DELETE' });
     logMsg('Deleted recording ' + name, 'ok');
     loadRecordings();
   } catch (e) {
@@ -640,7 +653,7 @@ async function stopTalk() {
       // 8kHz/8-bit mono instead of the 16kHz/16-bit WAV used for the direct HTTP path.
       const compactBlob = buildCompactWavForRelay(merged, srcRate);
       const b64 = await blobToBase64(compactBlob);
-      await sendNtfyCommand({ auth_token: currentToken(), action: 'TALK', talk_wav_b64: b64 });
+      await sendNtfyCommand({ action: 'TALK', talk_wav_b64: b64 });
       document.getElementById('talkStatus').innerText = 'Idle';
       logMsg('Talk clip published to ntfy topic', 'ok');
       return;
@@ -649,7 +662,7 @@ async function stopTalk() {
     const base = els.baseUrl.value.trim().replace(/\/$/, '');
     const res = await fetch(`${base}/api/talk`, {
       method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + currentToken(), 'Content-Type': 'audio/wav' },
+      headers: { 'Content-Type': 'audio/wav' },
       body: wavBlob
     });
     document.getElementById('talkStatus').innerText = 'Idle';
@@ -762,8 +775,6 @@ function encodeWav(pcm16, sampleRate) {
 }
 
 async function sendAction(action) {
-  const token = currentToken();
-  if (!token) { logMsg('Token field is empty', 'err'); return; }
   const payload = buildPayload(action);
   logMsg('Dispatching ' + action + ' via ' + mode + '...', 'info');
 
@@ -778,7 +789,7 @@ async function sendAction(action) {
   try {
     const res = await fetch(base + '/api/control', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
     const data = await res.json();
@@ -792,6 +803,259 @@ async function sendAction(action) {
     logMsg('Network failure: ' + e.message, 'err');
   }
 }
+
+// ---- LAN Fleet Scanner & Multi-Device Wall ----
+let fleetDevices = {};
+let fleetScanning = false;
+let fleetPollTimer = null;
+
+function detectDefaultSubnet() {
+  const host = window.location.hostname;
+  const m = host.match(/^(\d+\.\d+\.\d+)\.\d+$/);
+  return m ? m[1] : '192.168.1';
+}
+document.getElementById('fleetSubnets').value = detectDefaultSubnet();
+
+function fleetStreamParams() {
+  return {
+    mode: document.getElementById('selMode').value,
+    camera: document.getElementById('selCamera').value,
+    video_Resolution: document.getElementById('selRes').value,
+    video_bitrate_kbps: parseInt(document.getElementById('numBitrate').value, 10) || 1500,
+    fps: parseInt(document.getElementById('numFps').value, 10) || 30,
+    vox_threshold_db: parseInt(document.getElementById('numVox').value, 10) || 0,
+    motion_sensitivity: parseInt(document.getElementById('numMotion').value, 10) || 0,
+    record_locally: document.getElementById('chkRecordLocally').checked
+  };
+}
+
+async function probeFleetHost(ip) {
+  const controller = new AbortController();
+  // 1500ms rather than a tighter floor: a cold ARP-cache lookup on the first contact to a
+  // given LAN host can push a successful connect past 800ms even though the host answers
+  // promptly once cached, causing flaky false negatives on a fresh scan.
+  const timer = setTimeout(() => controller.abort(), 1500);
+  try {
+    const res = await fetch(`http://${ip}:5000/health`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.ok) return null;
+    return { ip, model: data.device_model || 'Unknown', state: data.state || 'IDLE' };
+  } catch (e) {
+    clearTimeout(timer);
+    return null;
+  }
+}
+
+async function scanAndActivateLan() {
+  if (fleetScanning) return;
+  fleetScanning = true;
+  const subnets = document.getElementById('fleetSubnets').value.split(',').map(s => s.trim()).filter(Boolean);
+  const concurrency = parseInt(document.getElementById('fleetConcurrency').value, 10) || 25;
+  const autoActivate = document.getElementById('chkAutoActivate').checked;
+  document.getElementById('fleetScanStatus').innerText = 'Scanning...';
+  logMsg('Scanning subnets: ' + subnets.join(', '), 'info');
+
+  const targets = [];
+  subnets.forEach(prefix => { for (let h = 1; h <= 254; h++) targets.push(prefix + '.' + h); });
+
+  let found = 0;
+  for (let i = 0; i < targets.length; i += concurrency) {
+    const batch = targets.slice(i, i + concurrency);
+    const results = await Promise.all(batch.map(probeFleetHost));
+    results.forEach(r => {
+      if (r) {
+        found++;
+        registerFleetDevice(r);
+        if (autoActivate) activateDevice(r.ip);
+      }
+    });
+    document.getElementById('fleetScanStatus').innerText =
+      `Scanning... (${Math.min(i + concurrency, targets.length)}/${targets.length}, ${found} found)`;
+  }
+  document.getElementById('fleetScanStatus').innerText = `Scan complete: ${found} device(s) found`;
+  logMsg(`LAN scan complete: ${found} device(s) found`, 'ok');
+  fleetScanning = false;
+  if (!fleetPollTimer) {
+    fleetPollTimer = setInterval(() => { Object.keys(fleetDevices).forEach(refreshFleetTileStatus); }, 3000);
+  }
+}
+
+function registerFleetDevice(info) {
+  const existing = fleetDevices[info.ip] || { audioOn: false };
+  fleetDevices[info.ip] = Object.assign({}, existing, info);
+  renderFleetGrid();
+}
+
+async function activateDevice(ip) {
+  try {
+    await fetch(`http://${ip}:5000/api/control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ action: 'START' }, fleetStreamParams()))
+    });
+    logMsg('Activated ' + ip, 'ok');
+  } catch (e) {
+    logMsg('Activate failed for ' + ip + ': ' + e.message, 'err');
+  }
+  refreshFleetTileStatus(ip);
+}
+
+async function stopDevice(ip) {
+  try {
+    await fetch(`http://${ip}:5000/api/control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'STOP' })
+    });
+  } catch (e) {
+    logMsg('Stop failed for ' + ip + ': ' + e.message, 'err');
+  }
+  refreshFleetTileStatus(ip);
+}
+
+function activateAllDiscovered() {
+  Object.keys(fleetDevices).forEach(activateDevice);
+}
+function stopAllDiscovered() {
+  Object.keys(fleetDevices).forEach(stopDevice);
+}
+
+async function fleetAction(ip, action) {
+  try {
+    await fetch(`http://${ip}:5000/api/control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action })
+    });
+  } catch (e) {
+    logMsg(`${action} failed for ${ip}: ${e.message}`, 'err');
+  }
+  refreshFleetTileStatus(ip);
+}
+
+async function refreshFleetTileStatus(ip) {
+  const dev = fleetDevices[ip];
+  if (!dev) return;
+  try {
+    const res = await fetch(`http://${ip}:5000/api/status`);
+    if (!res.ok) return;
+    const data = await res.json();
+    dev.state = data.state;
+    dev.battery = data.battery_percent;
+    dev.temp = data.temperature_c;
+    renderFleetGrid();
+  } catch (e) { /* unreachable this cycle, leave stale telemetry */ }
+}
+
+function selectAsPrimary(ip) {
+  els.baseUrl.value = `http://${ip}:5000`;
+  switchMode('direct');
+  connectDirect();
+  logMsg('Selected ' + ip + ' as primary controller target', 'info');
+}
+
+function toggleFleetAudio(ip) {
+  const dev = fleetDevices[ip];
+  if (!dev) return;
+  dev.audioOn = !dev.audioOn;
+  renderFleetGrid();
+}
+
+function renderFleetGrid() {
+  const grid = document.getElementById('fleetGrid');
+  const devices = Object.values(fleetDevices);
+  if (devices.length === 0) {
+    grid.innerHTML = '<div class="fleet-empty">No devices discovered yet — click Scan Subnet.</div>';
+    return;
+  }
+  grid.innerHTML = '';
+  devices.forEach(dev => {
+    const tile = document.createElement('div');
+    tile.className = 'fleet-tile';
+    const img = document.createElement('img');
+    img.src = `http://${dev.ip}:5000/api/snapshot.jpg?t=${Date.now()}`;
+    img.onerror = () => { img.style.opacity = '0.3'; };
+    const badge = document.createElement('div');
+    badge.className = 'fleet-badge';
+    badge.innerText = `${dev.model} · ${dev.ip}`;
+    const telemetry = document.createElement('div');
+    telemetry.className = 'fleet-telemetry';
+    telemetry.innerText = `${dev.state || '--'} · ${dev.battery != null ? dev.battery + '%' : '--'} · ${dev.temp != null ? Number(dev.temp).toFixed(1) + 'C' : '--'}`;
+    const actions = document.createElement('div');
+    actions.className = 'fleet-actions';
+    const mkBtn = (label, fn) => {
+      const b = document.createElement('button');
+      b.innerText = label;
+      b.onclick = fn;
+      return b;
+    };
+    actions.appendChild(mkBtn('Start', () => activateDevice(dev.ip)));
+    actions.appendChild(mkBtn('Stop', () => stopDevice(dev.ip)));
+    actions.appendChild(mkBtn('Switch Cam', () => fleetAction(dev.ip, 'SWITCH_CAMERA')));
+    actions.appendChild(mkBtn('Torch', () => fleetAction(dev.ip, 'TORCH_ON')));
+    actions.appendChild(mkBtn('Primary', () => selectAsPrimary(dev.ip)));
+    actions.appendChild(mkBtn(dev.audioOn ? 'Audio Off' : 'Audio On', () => toggleFleetAudio(dev.ip)));
+    tile.appendChild(img);
+    tile.appendChild(badge);
+    tile.appendChild(telemetry);
+    tile.appendChild(actions);
+    if (dev.audioOn) {
+      const audio = document.createElement('audio');
+      audio.autoplay = true;
+      audio.controls = true;
+      audio.style.width = '100%';
+      audio.src = `http://${dev.ip}:5000/api/audio.wav?t=${Date.now()}`;
+      tile.appendChild(audio);
+    }
+    grid.appendChild(tile);
+  });
+}
+
+// ---- Zero-touch launch: URL query params auto-populate the form and auto-connect/auto-start ----
+// e.g. remote_controller.html?ip=192.168.1.50&autostart=1&mode=BOTH&camera=BACK&res=720p&fps=30&bitrate=1500
+// or   remote_controller.html?ntfy=rm-a40-xxxxxx&autostart=1
+function applyQueryParamsAndAutoConnect() {
+  const qp = new URLSearchParams(window.location.search);
+  const fieldMap = { mode: 'selMode', camera: 'selCamera', res: 'selRes', fps: 'numFps', bitrate: 'numBitrate', vox: 'numVox', motion: 'numMotion' };
+  Object.keys(fieldMap).forEach(key => {
+    if (qp.has(key)) {
+      const el = document.getElementById(fieldMap[key]);
+      if (el) el.value = qp.get(key);
+    }
+  });
+
+  const qpIp = qp.get('ip');
+  const qpNtfy = qp.get('ntfy');
+  const autostart = qp.get('autostart') !== '0';
+  let willConnect = false;
+
+  if (qpIp) {
+    els.baseUrl.value = qpIp.startsWith('http') ? qpIp : `http://${qpIp}:5000`;
+    switchMode('direct');
+    connectDirect();
+    willConnect = true;
+  } else if (qpNtfy) {
+    els.ntfyTopic.value = qpNtfy;
+    switchMode('ntfy');
+    connectNtfy();
+    willConnect = true;
+  } else if (els.baseUrl.value.trim()) {
+    connectDirect();
+    willConnect = true;
+  } else if (els.ntfyTopic.value.trim()) {
+    switchMode('ntfy');
+    connectNtfy();
+    willConnect = true;
+  }
+
+  if (autostart && willConnect) {
+    setTimeout(() => sendAction('START'), 800);
+  }
+}
+
+applyQueryParamsAndAutoConnect();
 </script>
 </body>
 </html>

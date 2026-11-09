@@ -3,16 +3,31 @@ package com.remotemonitor.app
 import android.content.Context
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
+import java.util.concurrent.TimeUnit
 
 class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0", port) {
     companion object { private const val TAG = "RM-API" }
 
     private val recordingManager by lazy { RecordingManager(ctx) }
+
+    // Short-timeout client dedicated to the self /api/lan_scan subnet probe — distinct from
+    // MonitorService's sseClient, which is tuned for a long-lived relay connection instead.
+    private val lanScanClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(500, TimeUnit.MILLISECONDS)
+            .readTimeout(500, TimeUnit.MILLISECONDS)
+            .build()
+    }
 
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri ?: ""
@@ -35,7 +50,8 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
                 method == Method.GET && uri == "/api/recordings" -> handleRecordingsList(session)
                 method == Method.GET && uri.startsWith("/api/recordings/") -> handleRecordingDownload(session, uri.removePrefix("/api/recordings/"))
                 method == Method.DELETE && uri.startsWith("/api/recordings/") -> handleRecordingDelete(session, uri.removePrefix("/api/recordings/"))
-                method == Method.GET && uri == "/health" -> newFixedLengthResponse(Response.Status.OK, "application/json", """{"ok":true}""")
+                method == Method.GET && uri == "/health" -> handleHealth()
+                method == Method.GET && uri == "/api/lan_scan" -> handleLanScan()
                 else -> json(Response.Status.NOT_FOUND, """{"ok":false,"error":"not found"}""")
             }
         } catch (e: Exception) {
@@ -132,18 +148,56 @@ class ControlApiServer(private val ctx: Context, port: Int) : NanoHTTPD("0.0.0.0
         return json(Response.Status.OK, streamer.livePackJson().toString())
     }
 
-    private fun isAuthorized(session: IHTTPSession): Boolean {
-        if (MonitorBus.isAuthCooldownActive()) return false
-        val auth = session.headers["authorization"] ?: session.headers["Authorization"] ?: ""
-        val token = auth.removePrefix("Bearer ").removePrefix("bearer ").trim()
-        val qpToken = session.parameters["auth_token"]?.firstOrNull()
-        // Try the header token first, then the query-param fallback, without double-counting a
-        // failure for the same request when the first form is simply absent (blank).
-        if (token.isNotBlank() && AppConfig.checkAuth(ctx, token)) return true
-        if (qpToken != null && AppConfig.checkAuth(ctx, qpToken)) return true
-        if (token.isBlank() && qpToken == null) MonitorBus.recordAuthFailure()
-        return false
+    /** Zero-auth build: every endpoint is open to anyone who can reach the phone on the network. */
+    private fun isAuthorized(session: IHTTPSession): Boolean = true
+
+    /** Device identification for network scanners: anyone probing the subnet can tell RemoteMonitor phones apart. */
+    private fun handleHealth(): Response {
+        val svc = MonitorService.instance
+        val body = (svc?.deviceIdentityJson() ?: JSONObject()).apply {
+            put("ok", true)
+            put("state", MonitorBus.state.name)
+        }
+        return json(Response.Status.OK, body.toString())
     }
+
+    /**
+     * Server-side subnet scan for sibling RemoteMonitor devices: probes 1..254 on the phone's
+     * own /24 over port 5000/health in parallel. Bypasses browser Mixed-Content/Private Network
+     * Access restrictions that would otherwise block a page served over HTTPS (or a different
+     * origin) from reaching plain-HTTP LAN devices directly.
+     */
+    private fun handleLanScan(): Response {
+        val svc = MonitorService.instance
+            ?: return json(Response.Status.SERVICE_UNAVAILABLE, """{"ok":false,"error":"service not running"}""")
+        val selfIp = svc.statusJson().optString("ip", "")
+        val prefix = selfIp.substringBeforeLast('.', "")
+        if (prefix.isBlank()) {
+            return json(Response.Status.OK, """{"ok":true,"devices":[]}""")
+        }
+        val devices = runBlocking {
+            (1..254).map { host ->
+                async(Dispatchers.IO) { probeLanHost("$prefix.$host") }
+            }.awaitAll().filterNotNull()
+        }
+        val arr = JSONArray()
+        devices.forEach { arr.put(it) }
+        return json(Response.Status.OK, JSONObject().apply { put("ok", true); put("devices", arr) }.toString())
+    }
+
+    private fun probeLanHost(ip: String): JSONObject? = try {
+        val req = Request.Builder().url("http://$ip:5000/health").get().build()
+        lanScanClient.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val obj = JSONObject(resp.body?.string() ?: return null)
+            if (!obj.optBoolean("ok", false)) return null
+            JSONObject().apply {
+                put("ip", ip)
+                put("device_model", obj.optString("device_model", ""))
+                put("state", obj.optString("state", ""))
+            }
+        }
+    } catch (_: Exception) { null }
 
     /** POST raw WAV/PCM bytes, played immediately through the speaker. */
     private fun handleTalk(session: IHTTPSession): Response {
